@@ -1,0 +1,94 @@
+* { box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f4f5f7;
+  margin: 0;
+  padding: 40px 16px;
+  color: #1f2430;
+}
+
+.card {
+  max-width: 520px;
+  margin: 0 auto;
+  background: #fff;
+  border-radius: 12px;
+  padding: 32px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+h1 { font-size: 1.4rem; margin: 0 0 4px; }
+.subtitle { color: #6b7280; font-size: 0.9rem; margin: 0 0 24px; }
+
+.dropzone {
+  border: 2px dashed #c7cad1;
+  border-radius: 10px;
+  padding: 32px 16px;
+  text-align: center;
+  cursor: pointer;
+  color: #6b7280;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: #4f46e5;
+  background: #f5f4ff;
+}
+
+.file-info {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #f0f9f0;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.option-row { margin-top: 20px; }
+.toggle { display: flex; align-items: center; gap: 8px; font-size: 0.95rem; cursor: pointer; }
+.toggle input { width: 16px; height: 16px; }
+.hint { color: #9096a2; font-size: 0.8rem; margin: 4px 0 0 24px; }
+
+.primary-btn {
+  display: block;
+  width: 100%;
+  margin-top: 24px;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  background: #4f46e5;
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+  text-decoration: none;
+}
+.primary-btn:disabled { background: #c7cad1; cursor: not-allowed; }
+.primary-btn:not(:disabled):hover { background: #4338ca; }
+
+.progress-section { margin-top: 24px; }
+.progress-bar {
+  height: 10px;
+  border-radius: 6px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: #4f46e5;
+  transition: width 0.3s ease;
+}
+#progressLabel { margin-top: 8px; font-size: 0.85rem; color: #6b7280; text-align: center; }
+
+.result-section { margin-top: 20px; }
+
+.error-box {
+  margin-top: 16px;
+  padding: 10px 12px;
+  background: #fdecec;
+  color: #b42318;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.hidden { display: none !important; }

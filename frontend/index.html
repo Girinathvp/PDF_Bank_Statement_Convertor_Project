@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bank Statement PDF → Excel Converter</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="card">
+    <h1>PDF Bank Statement → Excel</h1>
+    <p class="subtitle">Works with lined tables, unlined (spaced-text) tables, and scanned statements (via OCR).</p>
+
+    <div id="dropzone" class="dropzone">
+      <p>Drag &amp; drop a PDF here, or click to browse</p>
+      <input type="file" id="fileInput" accept="application/pdf" hidden>
+    </div>
+
+    <div id="fileInfo" class="file-info hidden"></div>
+
+    <div class="option-row">
+      <label class="toggle">
+        <input type="checkbox" id="mergeToggle" checked>
+        <span>Merge all pages into a single Excel sheet</span>
+      </label>
+      <p class="hint" id="toggleHint">Unchecked = each PDF page becomes its own Excel tab.</p>
+    </div>
+
+    <button id="convertBtn" class="primary-btn" disabled>Convert to Excel</button>
+
+    <div id="progressSection" class="progress-section hidden">
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+      <p id="progressLabel">Starting…</p>
+    </div>
+
+    <div id="resultSection" class="result-section hidden">
+      <a id="downloadLink" class="primary-btn" download>Download Excel file</a>
+    </div>
+
+    <div id="errorBox" class="error-box hidden"></div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>

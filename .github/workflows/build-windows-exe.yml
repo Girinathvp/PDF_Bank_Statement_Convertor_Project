@@ -1,0 +1,78 @@
+name: Build Windows Desktop App
+
+# Builds the actual .exe on a real Windows machine (GitHub's own Windows
+# runners) -- this can't be done from Linux/macOS, since PyInstaller (and
+# essentially every Python bundler) only compiles for the OS it's actually
+# running on, not cross-platform.
+#
+# Runs automatically on every push to main, and can also be triggered
+# manually from the Actions tab ("Run workflow" button). The finished .exe
+# is attached as a downloadable build artifact -- no Windows machine, no
+# PowerShell, no manual build steps needed on your end.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-windows.txt
+
+      - name: Download and stage portable Tesseract OCR (for a self-contained exe)
+        shell: pwsh
+        run: |
+          # Grabs the LATEST UB-Mannheim Tesseract-OCR Windows installer via
+          # GitHub's release API (rather than a hardcoded version/filename,
+          # which would silently go stale whenever they cut a new release),
+          # then extracts just the files needed to bundle into the exe --
+          # so the person running it doesn't need to install Tesseract
+          # separately at all.
+          $ErrorActionPreference = "Stop"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest" -Headers @{ "User-Agent" = "github-actions" }
+          $asset = $release.assets | Where-Object { $_.name -match "w64-setup.*\.exe$" } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Could not find a w64-setup .exe asset in the latest UB-Mannheim/tesseract release. Check https://github.com/UB-Mannheim/tesseract/releases manually and update this workflow if the asset naming changed."
+          }
+          Write-Host "Downloading $($asset.name) ..."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile tesseract-installer.exe
+          Start-Process -FilePath ".\tesseract-installer.exe" -ArgumentList "/S", "/D=C:\tesseract-install" -Wait
+          if (-not (Test-Path "C:\tesseract-install\tesseract.exe")) {
+            throw "Tesseract installer ran but tesseract.exe was not found at the expected path -- the installer's silent-install flags may have changed. Check the installer manually."
+          }
+          New-Item -ItemType Directory -Force -Path backend\tesseract | Out-Null
+          Copy-Item -Path "C:\tesseract-install\*" -Destination backend\tesseract -Recurse -Force
+          Write-Host "Tesseract staged at backend\tesseract:"
+          Get-ChildItem backend\tesseract | Select-Object -First 20
+
+      - name: Build the .exe with PyInstaller
+        working-directory: backend
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "BankStatementConverter" `
+            --add-data "..\frontend;frontend" `
+            --add-data "tesseract;tesseract" `
+            desktop_app.py
+
+      - name: Upload the .exe as a downloadable build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BankStatementConverter-windows-exe
+          path: backend/dist/BankStatementConverter.exe
+          retention-days: 90

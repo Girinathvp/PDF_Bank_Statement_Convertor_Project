@@ -1,0 +1,12 @@
+**/__pycache__
+**/*.pyc
+backend/venv
+backend/uploads/*
+backend/outputs/*
+backend/dist
+backend/build
+.git
+.gitignore
+*.xlsx
+*.pdf
+*.spec
