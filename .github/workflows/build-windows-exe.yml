@@ -37,6 +37,8 @@ jobs:
 
       - name: Download and stage portable Tesseract OCR (for a self-contained exe)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Grabs the LATEST UB-Mannheim Tesseract-OCR Windows installer via
           # GitHub's release API (rather than a hardcoded version/filename,
@@ -44,21 +46,60 @@ jobs:
           # then extracts just the files needed to bundle into the exe --
           # so the person running it doesn't need to install Tesseract
           # separately at all.
+          #
+          # Uses the Actions-provided GH_TOKEN to authenticate the API call:
+          # unauthenticated GitHub API requests are capped at 60/hour per IP,
+          # and Actions runners share IPs, so this call can otherwise be
+          # rate-limited (exit code 1 with no obvious cause in the summary
+          # view). Falls back to a known-good pinned version if the dynamic
+          # lookup fails for any other reason, so a transient API problem
+          # doesn't hard-fail the whole build.
           $ErrorActionPreference = "Stop"
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest" -Headers @{ "User-Agent" = "github-actions" }
-          $asset = $release.assets | Where-Object { $_.name -match "w64-setup.*\.exe$" } | Select-Object -First 1
-          if (-not $asset) {
-            throw "Could not find a w64-setup .exe asset in the latest UB-Mannheim/tesseract release. Check https://github.com/UB-Mannheim/tesseract/releases manually and update this workflow if the asset naming changed."
+          $FALLBACK_URL = "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+
+          $downloadUrl = $null
+          try {
+            Write-Host "Looking up latest UB-Mannheim/tesseract release via GitHub API..."
+            $headers = @{ "User-Agent" = "github-actions"; "Accept" = "application/vnd.github+json" }
+            if ($env:GH_TOKEN) { $headers["Authorization"] = "Bearer $env:GH_TOKEN" }
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest" -Headers $headers
+            $asset = $release.assets | Where-Object { $_.name -match "w64-setup.*\.exe$" } | Select-Object -First 1
+            if ($asset) {
+              $downloadUrl = $asset.browser_download_url
+              Write-Host "Found latest release asset: $($asset.name)"
+            } else {
+              Write-Host "WARNING: API call succeeded but no w64-setup .exe asset was found in the response. Falling back to pinned version."
+            }
+          } catch {
+            Write-Host "WARNING: Dynamic release lookup failed ($($_.Exception.Message)). Falling back to pinned version."
           }
-          Write-Host "Downloading $($asset.name) ..."
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile tesseract-installer.exe
-          Start-Process -FilePath ".\tesseract-installer.exe" -ArgumentList "/S", "/D=C:\tesseract-install" -Wait
+
+          if (-not $downloadUrl) {
+            $downloadUrl = $FALLBACK_URL
+            Write-Host "Using fallback URL: $downloadUrl"
+          }
+
+          Write-Host "Downloading Tesseract installer..."
+          Invoke-WebRequest -Uri $downloadUrl -OutFile tesseract-installer.exe
+          $installerInfo = Get-Item tesseract-installer.exe
+          Write-Host "Downloaded installer: $($installerInfo.Length) bytes"
+          if ($installerInfo.Length -lt 1000000) {
+            throw "Downloaded installer is suspiciously small ($($installerInfo.Length) bytes) -- likely an HTML error page instead of the real installer. Check $downloadUrl manually."
+          }
+
+          Write-Host "Running silent install..."
+          $proc = Start-Process -FilePath ".\tesseract-installer.exe" -ArgumentList "/S", "/D=C:\tesseract-install" -Wait -PassThru
+          Write-Host "Installer exit code: $($proc.ExitCode)"
+
           if (-not (Test-Path "C:\tesseract-install\tesseract.exe")) {
-            throw "Tesseract installer ran but tesseract.exe was not found at the expected path -- the installer's silent-install flags may have changed. Check the installer manually."
+            Write-Host "Contents of C:\tesseract-install (if it exists):"
+            if (Test-Path "C:\tesseract-install") { Get-ChildItem "C:\tesseract-install" -Recurse | Select-Object -First 30 }
+            throw "tesseract.exe not found after silent install. The installer's silent-install flags may have changed -- check https://github.com/UB-Mannheim/tesseract for current usage."
           }
+
           New-Item -ItemType Directory -Force -Path backend\tesseract | Out-Null
           Copy-Item -Path "C:\tesseract-install\*" -Destination backend\tesseract -Recurse -Force
-          Write-Host "Tesseract staged at backend\tesseract:"
+          Write-Host "Tesseract staged successfully at backend\tesseract:"
           Get-ChildItem backend\tesseract | Select-Object -First 20
 
       - name: Build the .exe with PyInstaller
