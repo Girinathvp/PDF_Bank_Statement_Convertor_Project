@@ -88,17 +88,38 @@ jobs:
           }
 
           Write-Host "Running silent install..."
-          $proc = Start-Process -FilePath ".\tesseract-installer.exe" -ArgumentList "/S", "/D=C:\tesseract-install" -Wait -PassThru
+          $installDir = "C:\tesseract-install"
+          $proc = Start-Process -FilePath ".\tesseract-installer.exe" -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
           Write-Host "Installer exit code: $($proc.ExitCode)"
-
-          if (-not (Test-Path "C:\tesseract-install\tesseract.exe")) {
-            Write-Host "Contents of C:\tesseract-install (if it exists):"
-            if (Test-Path "C:\tesseract-install") { Get-ChildItem "C:\tesseract-install" -Recurse | Select-Object -First 30 }
-            throw "tesseract.exe not found after silent install. The installer's silent-install flags may have changed -- check https://github.com/UB-Mannheim/tesseract for current usage."
+          if ($proc.ExitCode -ne 0) {
+            throw "Tesseract installer exited with a non-zero code ($($proc.ExitCode)) -- the install itself failed rather than merely landing in an unexpected folder. This usually means a corrupted download or an incompatible installer flag; check the exit code against NSIS's standard error codes, or try the install manually on a Windows machine to see what it reports interactively."
           }
 
+          # Some NSIS builds return control to the parent process slightly
+          # before background file extraction finishes -- give it a moment.
+          Start-Sleep -Seconds 5
+
+          # /D should place files at $installDir, but fall back to
+          # Tesseract's own default location in case that flag was ignored
+          # for any reason (verified needed on at least one real run: the
+          # installer exited 0 but tesseract.exe wasn't at the /D path).
+          $candidates = @("$installDir\tesseract.exe", "C:\Program Files\Tesseract-OCR\tesseract.exe")
+          $foundExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $foundExe) {
+            Write-Host "tesseract.exe not found at any expected location. Diagnostics:"
+            Write-Host "Contents of ${installDir}:"
+            if (Test-Path $installDir) { Get-ChildItem $installDir -Recurse | Select-Object -First 30 } else { Write-Host "  (directory does not exist)" }
+            Write-Host "Contents of C:\Program Files\Tesseract-OCR:"
+            if (Test-Path "C:\Program Files\Tesseract-OCR") { Get-ChildItem "C:\Program Files\Tesseract-OCR" -Recurse | Select-Object -First 30 } else { Write-Host "  (directory does not exist)" }
+            throw "tesseract.exe not found after a silent install that reported success (exit code 0). See the directory listings above -- the installer may have used a different location, or silently no-op'd. Check https://github.com/UB-Mannheim/tesseract for current installer usage."
+          }
+
+          $actualInstallDir = Split-Path $foundExe -Parent
+          Write-Host "Found tesseract.exe at: $foundExe"
+
           New-Item -ItemType Directory -Force -Path backend\tesseract | Out-Null
-          Copy-Item -Path "C:\tesseract-install\*" -Destination backend\tesseract -Recurse -Force
+          Copy-Item -Path "$actualInstallDir\*" -Destination backend\tesseract -Recurse -Force
           Write-Host "Tesseract staged successfully at backend\tesseract:"
           Get-ChildItem backend\tesseract | Select-Object -First 20
 
