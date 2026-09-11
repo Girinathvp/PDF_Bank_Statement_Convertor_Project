@@ -3,6 +3,7 @@ app.py - Flask API for PDF bank statement -> Excel conversion.
 """
 
 import os
+import sys
 import uuid
 import threading
 import time
@@ -18,7 +19,17 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
+if getattr(sys, "frozen", False):
+    # Running as a PyInstaller-frozen executable: --add-data bundles
+    # 'frontend' directly at the extraction root (sys._MEIPASS) at build
+    # time, NOT as a sibling of this file's own location the way it is in
+    # the normal source tree -- BASE_DIR/../frontend does not exist inside
+    # a frozen build and would make Flask (and the background server
+    # thread that runs it) fail to start with no visible error, since a
+    # --windowed exe has no console to show a traceback on.
+    FRONTEND_DIR = os.path.join(sys._MEIPASS, "frontend")
+else:
+    FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
 
 app = Flask(
     __name__,
@@ -38,7 +49,9 @@ if not os.path.isfile(os.path.join(_resolved_frontend_dir, "index.html")):
         "\n\nFATAL: could not find frontend/index.html at "
         f"{_resolved_frontend_dir}\nContents of {parent}: {parent_contents}\n"
         "Check that Dockerfile, backend/, and frontend/ are siblings at the "
-        "repo root, and that your host's Root Directory setting matches.\n"
+        "repo root, and that your host's Root Directory setting matches. "
+        "(If this is a PyInstaller build: confirm --add-data \"..\\frontend;frontend\" "
+        "was included in the build command.)\n"
     )
 
 app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
