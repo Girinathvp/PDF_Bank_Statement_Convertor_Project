@@ -126,7 +126,7 @@ jobs:
       - name: Build the .exe with PyInstaller
         working-directory: backend
         run: |
-          pyinstaller --noconfirm --onefile --windowed `
+          pyinstaller --noconfirm --clean --onefile --windowed `
             --name "BankStatementConverter" `
             --add-data "..\frontend;frontend" `
             --add-data "tesseract;tesseract" `
