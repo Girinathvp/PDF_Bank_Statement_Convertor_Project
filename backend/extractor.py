@@ -59,6 +59,7 @@ HEADER_KEYWORDS = [
     "date", "particulars", "narration", "description", "details",
     "chq", "cheque", "ref", "reference",
     "withdrawal", "debit", "deposit", "credit", "balance", "amount",
+    "value", "txn", "remarks",
 ]
 
 FOOTER_MARKERS = [
@@ -67,9 +68,29 @@ FOOTER_MARKERS = [
     "visit us at", "customer care", "toll-free", "toll free",
     "generated statement", "statement summary",
     "dr count", "cr count", "total debits", "total credits",
+    "grand total", "end of statement", "abbreviations used", "disclaimer",
+    "computer generated statement", "corporate office", "registered office",
+    "regd. office", "regd office",
 ]
 
-DATE_RE = re.compile(r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$")
+_MONTH_NAME = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+# Universal date vocabulary. Banks print dates in many ways, e.g.
+#   01-04-2025  01/04/25  01.04.2025          (numeric, day first)   SIB/SBI/HDFC/ICICI
+#   04-APR-2025 04-Apr-25 04/Apr/2025 04Apr2025                      Federal/Axis/Kotak
+#   04 Apr 2025  04 April, 2025                (split over 2-3 words) Kotak/IDFC/statements from Excel
+#   2025-04-01                                  (ISO)                 many CSV-derived PDFs
+#   Apr 04, 2025                                (month first)         some foreign/NRI formats
+# A token (or up to 3 adjacent tokens joined with a space) is a date if it
+# matches any of these.
+DATE_RE = re.compile(
+    r"^(?:"
+    r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+    r"|\d{1,2}[-/. ]?" + _MONTH_NAME + r"[-/., ]?\s?\d{2,4}"
+    r"|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+    r"|" + _MONTH_NAME + r"[-/ ]?\d{1,2},?[-/ ]?\d{2,4}"
+    r")$",
+    re.IGNORECASE,
+)
 PARTIAL_DATE_RE = re.compile(r"^[-/.]\d{1,2}[-/.]\d{2,4}$")
 CARRY_FORWARD_RE = re.compile(r"^(b/f|c/f|bf|cf|brought|forward)$", re.IGNORECASE)
 
@@ -107,6 +128,13 @@ def _extract_leading_date(tokens):
         combined = t0 + tokens[1]
         if DATE_RE.match(combined):
             return combined, tokens[2:]
+    # Dates printed with spaces ("04 Apr 2025", "Apr 04, 2025") arrive as
+    # 2-3 separate words -- try joining them.
+    for n in (3, 2):
+        if len(tokens) >= n:
+            combined = " ".join(tokens[:n])
+            if DATE_RE.match(combined):
+                return combined, tokens[n:]
     return None, tokens
 
 
@@ -130,8 +158,8 @@ def _is_full_date(text):
     text = (text or "").strip()
     if not text:
         return False
-    first_token = text.split()[0]
-    return bool(DATE_RE.match(first_token)) or bool(CARRY_FORWARD_RE.match(first_token))
+    date, _ = _extract_leading_date(text.split())
+    return date is not None and not PARTIAL_DATE_RE.match(date)
 
 
 def _is_footer_text(joined_lower):
@@ -166,7 +194,9 @@ def _line_avg_top(line):
 
 
 def _line_has_date_token(line):
-    return any(DATE_RE.match(w["text"]) for w in line)
+    texts = [w["text"] for w in line]
+    return any(_extract_leading_date(texts[i:])[0] is not None and not CARRY_FORWARD_RE.match(texts[i])
+               for i in range(len(texts)))
 
 
 # ---------------------------------------------------------------------------
@@ -199,17 +229,40 @@ def _find_header_lines(lines, max_gap=12):
         return None, None
 
     header_lines = [lines[best_idx]]
-    header_top = _line_avg_top(lines[best_idx])
     data_start = best_idx + 1
+    best_len = len(lines[best_idx])
 
-    # Extend into the line immediately after, if it's close vertically and
-    # doesn't look like an actual transaction row (which would mean we've
-    # run past the header into real data).
-    if best_idx + 1 < len(lines):
-        nxt = lines[best_idx + 1]
-        if abs(_line_avg_top(nxt) - header_top) <= max_gap and not _line_has_date_token(nxt):
+    def _is_header_fragment_line(line):
+        # A stacked header fragment (e.g. "Tran" / "Cheque" / "DR" printed
+        # above "Type" / "Details" / "/CR") is short, has no dates and no
+        # money amounts.
+        if _line_has_date_token(line):
+            return False
+        if any(re.match(r"^[\d,]+\.\d{2}$", w["text"]) for w in line):
+            return False
+        return len(line) <= best_len
+
+    # Headers can wrap over up to 3 physical lines (Federal Bank prints
+    # "Tran/Type", "Cheque/Details" and "DR//CR" stacked around the main
+    # header line). Extend upward and downward while the neighbouring line
+    # is vertically close and looks like a header fragment rather than data.
+    # Downward (original behaviour): the line immediately after.
+    idx = best_idx
+    while idx + 1 < len(lines) and len(header_lines) < 3:
+        nxt = lines[idx + 1]
+        if abs(_line_avg_top(nxt) - _line_avg_top(lines[idx])) <= max_gap and _is_header_fragment_line(nxt):
             header_lines.append(nxt)
-            data_start = best_idx + 2
+            idx += 1
+            data_start = idx + 1
+        else:
+            break
+    # Upward: at most one line, and only when very close (a wrapped label
+    # sits within about one text-line height of the main header).
+    if best_idx - 1 >= 0 and len(header_lines) < 3:
+        prv = lines[best_idx - 1]
+        if (abs(_line_avg_top(lines[best_idx]) - _line_avg_top(prv)) <= max_gap * 0.6
+                and _is_header_fragment_line(prv)):
+            header_lines.insert(0, prv)
 
     return header_lines, data_start
 
@@ -319,12 +372,89 @@ def _build_columns(header_line_groups, page_width, merge_gap):
     if not has_date_col and merged and merged[0]["x0"] > page_width * 0.05:
         merged.insert(0, {"text": "DATE", "x0": 0.0, "x1": merged[0]["x0"]})
 
+    # A separate "DR/CR" (or "Cr/Dr") indicator column immediately to the
+    # right of Balance/Amount is really that amount's sign (Federal Bank:
+    # "29793.00" | "Cr"). Fold it into the amount column so the value reads
+    # "29793.00 Cr" exactly like banks that print the suffix inline.
+    folded = []
+    for w in merged:
+        norm = re.sub(r"[^a-z]", "", w["text"].lower())
+        if (norm in ("drcr", "crdr") and folded
+                and any(k in folded[-1]["text"].lower() for k in ("balance", "amount"))):
+            folded[-1] = dict(folded[-1])
+            folded[-1]["x1"] = max(folded[-1]["x1"], w["x1"])
+            continue
+        folded.append(w)
+    merged = folded
+
     columns = []
     for i, w in enumerate(merged):
         start = 0.0 if i == 0 else (merged[i - 1]["x0"] + w["x0"]) / 2
         end = page_width + 1000 if i == len(merged) - 1 else (w["x0"] + merged[i + 1]["x0"]) / 2
         label = " ".join(w["text"].strip().rstrip(".:—-").split())
-        columns.append({"label": label or f"Col{i+1}", "x_start": start, "x_end": end})
+        label = re.sub(r"\s*/\s*", "/", label)
+        columns.append({"label": label or f"Col{i+1}", "x_start": start, "x_end": end,
+                        "_hx": (w["x0"] + w["x1"]) / 2})
+    return columns
+
+
+def _refine_boundaries_from_data(columns, lines, header_line_count=0):
+    """
+    Header-derived boundaries (midpoint between neighbouring header
+    labels) assume every column is left-aligned under its label. Many
+    banks centre or right-align columns, so a midpoint can cut straight
+    through a column's data (e.g. Federal Bank's Particulars text runs
+    well past the midpoint towards the centred "Tran Type" column, pushing
+    narration words into the wrong column).
+
+    The data itself shows where columns really are: between two columns
+    there's a vertical strip of whitespace that (almost) no word crosses.
+    For each boundary that currently cuts through words, move it into the
+    whitespace gap between the two neighbouring header labels. Boundaries
+    that already sit in whitespace are left untouched.
+    """
+    data_lines = [ln for ln in lines if _line_has_date_token(ln)]
+    if len(data_lines) < 3 or len(columns) < 2:
+        return columns
+    words = [w for ln in data_lines for w in ln]
+    min_x = int(min(w["x0"] for w in words))
+    max_x = int(max(w["x1"] for w in words)) + 1
+    cover = [0] * (max_x - min_x + 2)
+    for w in words:
+        for x in range(int(w["x0"]) - min_x, int(w["x1"]) - min_x + 1):
+            cover[x] += 1
+    # A column separator may be crossed by an occasional over-long word;
+    # treat x as whitespace if only a few percent of words touch it.
+    thresh = max(0, int(len(data_lines) * 0.03))
+
+    def is_gap(x):
+        i = int(x) - min_x
+        return i < 0 or i >= len(cover) or cover[i] <= thresh
+
+    columns = [dict(c) for c in columns]
+    for i in range(1, len(columns)):
+        b = columns[i]["x_start"]
+        if is_gap(b):
+            continue
+        lo = columns[i - 1].get("_hx", columns[i - 1]["x_start"])
+        hi = columns[i].get("_hx", b)
+        # search window: between the two header label centres
+        best = None
+        run_start = None
+        for x in range(int(lo), int(hi) + 2):
+            if is_gap(x) and x <= hi:
+                if run_start is None:
+                    run_start = x
+            else:
+                if run_start is not None:
+                    run = (run_start, x - 1)
+                    if best is None or (run[1] - run[0]) > (best[1] - best[0]):
+                        best = run
+                    run_start = None
+        if best is not None:
+            nb = (best[0] + best[1]) / 2
+            columns[i]["x_start"] = nb
+            columns[i - 1]["x_end"] = nb
     return columns
 
 
@@ -382,7 +512,15 @@ def _assign_line_to_columns(line, columns):
 
 
 _NUMERIC_CODE_RE = re.compile(r"^[\d/\-\.]{3,}$")
-_AMOUNT_RE = re.compile(r"^(?:[\d,]+(?:\.\d{2})?(?:\s*(?:cr|dr))?|(?:cr|dr))$", re.IGNORECASE)
+# Many banks use alphanumeric cheque/reference IDs (e.g. "REF099",
+# "SBIN0012345", "S84020056"). Accept an uppercase code containing a digit,
+# but not slash-separated narration fragments ("UPI/DR/...").
+_ALNUM_REF_RE = re.compile(r"^(?=.*\d)[A-Z0-9\-.]{3,30}$")
+
+
+def _is_reference_token(t):
+    return bool(_NUMERIC_CODE_RE.match(t) or _ALNUM_REF_RE.match(t))
+_AMOUNT_RE = re.compile(r"^(?:-?[\d,]+(?:\.\d{2})?(?:\s*\(?(?:cr|dr)\)?\.?)?|\(?(?:cr|dr)\)?\.?)$", re.IGNORECASE)
 _STRAY_PUNCT_TOKEN_RE = re.compile(r"(?:^|(?<=\s))[.,](?=\s|$)")
 
 
@@ -747,8 +885,8 @@ def _final_validate_row(row, columns, date_labels):
             continue
         if not _looks_like_amount(val):
             return True
-        if "balance" in label_lower and not _has_cr_dr_suffix(val):
-            return True
+        # (Missing Cr/Dr suffix on Balance is judged at document level in
+        # write_excel -- many banks, e.g. HDFC/ICICI, never print one.)
     return False
 
 
@@ -794,8 +932,8 @@ def _reconcile_columns(row, columns, date_labels):
         if not text:
             continue
         tokens = text.split()
-        numeric_tokens = [t for t in tokens if _NUMERIC_CODE_RE.match(t)]
-        stray_tokens = [t for t in tokens if not _NUMERIC_CODE_RE.match(t)]
+        numeric_tokens = [t for t in tokens if _is_reference_token(t)]
+        stray_tokens = [t for t in tokens if not _is_reference_token(t)]
         if stray_tokens:
             row[particulars_label] = f"{row[particulars_label]} {' '.join(stray_tokens)}".strip()
             row[c["label"]] = " ".join(numeric_tokens)
@@ -878,7 +1016,25 @@ def _relabel_columns_from_locked(columns, locked_columns):
     return relabeled
 
 
-def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None, ocr_context=None):
+def _is_prose_line(row, columns):
+    """A line with no date that spreads text across 4+ columns without a
+    single money amount is page furniture (bank address footer, disclaimer
+    paragraph, abbreviations legend) rather than a transaction or a
+    narration continuation, which lives in Particulars (plus maybe a
+    wrapped Cr/Dr or amount)."""
+    filled = [c for c in columns if row.get(c["label"])]
+    if len(filled) < 4:
+        return False
+    for c in columns:
+        if any(k in c["label"].lower() for k in _AMOUNT_COLUMN_KEYWORDS):
+            v = row.get(c["label"], "")
+            if v and re.search(r"\d", v) and _looks_like_amount(v):
+                return False
+    return True
+
+
+def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None, ocr_context=None,
+                        refine_from_data=False):
     lines = _group_words_into_lines(words, y_tol=y_tol)
     header_line_groups, data_start = _find_header_lines(lines)
 
@@ -886,6 +1042,8 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
         columns = _build_columns(header_line_groups, page_width, merge_gap)
         columns = _ensure_reference_column(columns, locked_columns)
         columns = _relabel_columns_from_locked(columns, locked_columns)
+        if refine_from_data:
+            columns = _refine_boundaries_from_data(columns, lines[data_start:])
     elif locked_columns is not None:
         columns = locked_columns
         date_labels = _date_column_labels(columns) or [columns[0]["label"]]
@@ -911,6 +1069,8 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
             break
 
         row, row_words = _assign_line_to_columns(line, columns)
+        if not _looks_like_date(row.get(primary_date_label, "")) and _is_prose_line(row, columns):
+            continue
         row = _refine_low_confidence_cells(row, row_words, columns, date_labels, ocr_context)
         row = _reconcile_columns(row, columns, date_labels)
         date_val = row.get(primary_date_label, "")
@@ -1081,7 +1241,7 @@ def extract_page(page, locked_columns=None):
 
     header, rows, columns = _extract_structured(
         words, page.width, y_tol=y_tol, merge_gap=merge_gap, locked_columns=locked_columns,
-        ocr_context=ocr_context,
+        ocr_context=ocr_context, refine_from_data=(method == "text"),
     )
     if header is None:
         return {"type": "none"}, method, locked_columns
@@ -1479,6 +1639,18 @@ def write_excel(results, output_path, merge_pages=True):
     ]
     if debit_label is not None and credit_label is not None:
         _correct_balances_via_running_total(all_rows_in_doc_order, debit_label, credit_label, balance_label)
+
+    # Balance Cr/Dr suffix check, document-wide: only a statement that
+    # normally prints a suffix on its balances (SIB, SBI, Federal) should
+    # have a row flagged for missing one.
+    if balance_label:
+        balances = [r.get(balance_label, "") for r in all_rows_in_doc_order if r.get(balance_label)]
+        with_suffix = sum(1 for b in balances if _has_cr_dr_suffix(b))
+        if balances and with_suffix >= len(balances) / 2:
+            for r in all_rows_in_doc_order:
+                b = r.get(balance_label, "")
+                if b and not _has_cr_dr_suffix(b):
+                    r[_NEEDS_REVIEW_KEY] = True
 
     def row_flag(row):
         return bool(row.get(_NEEDS_REVIEW_KEY, False))
