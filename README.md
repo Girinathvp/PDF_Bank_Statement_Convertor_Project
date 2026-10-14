@@ -81,6 +81,26 @@ Minor narration misreads (e.g. "UPI/CR" read as "BIC R") aren't corrected
 by this mechanism, since free-text narration has no fixed format to
 validate against — only the structured date/amount columns are.
 
+## Bank selection, auto-detect and totals check
+
+The UI asks which bank issued the statement. Verified banks (checked end to
+end against real statements): **South Indian Bank, SBI, Federal Bank, CSB
+Bank**. Beta banks (generic engine + header hints, not yet validated on a
+real sample): HDFC, ICICI, Axis, Kotak, Canara, Bank of Baroda, Union, PNB,
+IDFC FIRST, ESAF, Dhanlaxmi, Kerala Gramin. "Other bank" uses the fully
+generic layout detection.
+
+- Profiles live in `backend/banks.py`. They are hints for the single
+  extraction engine, never separate parsers.
+- Auto-detect reads the labelled IFSC (e.g. `IFS Code: CSBK0000220`) or bank
+  name from page 1's text layer only (no OCR, ~0.1s). Scanned PDFs rely on the
+  user's selection.
+- After conversion the extracted totals are compared with any totals
+  printed on the statement (opening/closing balance, total debits/credits,
+  GRAND TOTAL) and shown in the result panel.
+- Bordered tables (e.g. CSB): when the PDF has vertical table rulings, they
+  are used as exact column boundaries.
+
 ## Web app: local run
 ```bash
 cd backend

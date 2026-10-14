@@ -78,7 +78,7 @@ class Api:
     def __init__(self, port):
         self.port = port
 
-    def save_excel(self, job_id):
+    def save_excel(self, job_id, suggested_name=None):
         import urllib.request
         import urllib.error
 
@@ -96,7 +96,7 @@ class Api:
         result = webview.windows[0].create_file_dialog(
             webview.SAVE_DIALOG,
             directory="",
-            save_filename="converted_statement.xlsx",
+            save_filename=suggested_name or "converted_statement.xlsx",
             file_types=("Excel Files (*.xlsx)",),
         )
         if not result:

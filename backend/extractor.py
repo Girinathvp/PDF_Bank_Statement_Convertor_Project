@@ -46,8 +46,11 @@ def get_page_count(pdf_path):
 
 
 def estimate_tat(num_pages, likely_ocr=False):
+    # Measured: scanned (OCR) pages ~1.6s each; text-layer pages ~0.1s each
+    # (CSB, 95 pages: ~9s). Kept slightly pessimistic -- the live ETA
+    # corrects it within the first few pages.
     base_overhead = 3
-    per_page = 1.6 if likely_ocr else 0.5
+    per_page = 1.6 if likely_ocr else 0.15
     return round(base_overhead + per_page * num_pages)
 
 
@@ -92,6 +95,10 @@ DATE_RE = re.compile(
     re.IGNORECASE,
 )
 PARTIAL_DATE_RE = re.compile(r"^[-/.]\d{1,2}[-/.]\d{2,4}$")
+# Day+month with the year wrapped onto the next physical line, e.g. CSB
+# prints "01-APR-" on one line and "2025" directly below it.
+DATE_HEAD_RE = re.compile(r"^\d{1,2}[-/.](?:\d{1,2}|" + _MONTH_NAME + r")[-/.]$", re.IGNORECASE)
+YEAR_TAIL_RE = re.compile(r"^(?:\d{4}|\d{2})$")
 CARRY_FORWARD_RE = re.compile(r"^(b/f|c/f|bf|cf|brought|forward)$", re.IGNORECASE)
 
 # Per-page footer noise (e.g. "Page no. 1", "Page 3 of 45") that can end up
@@ -123,6 +130,10 @@ def _extract_leading_date(tokens):
     if DATE_RE.match(t0) or CARRY_FORWARD_RE.match(t0):
         return t0, tokens[1:]
     if PARTIAL_DATE_RE.match(t0):
+        return t0, tokens[1:]
+    if DATE_HEAD_RE.match(t0):
+        if len(tokens) >= 2 and YEAR_TAIL_RE.match(tokens[1]):
+            return t0 + tokens[1], tokens[2:]
         return t0, tokens[1:]
     if len(tokens) >= 2:
         combined = t0 + tokens[1]
@@ -159,10 +170,15 @@ def _is_full_date(text):
     if not text:
         return False
     date, _ = _extract_leading_date(text.split())
-    return date is not None and not PARTIAL_DATE_RE.match(date)
+    return date is not None and not PARTIAL_DATE_RE.match(date) and not DATE_HEAD_RE.match(date)
+
+
+_PAGE_LINE_RE = re.compile(r"^page\s*(no\.?)?\s*\d+(\s*of\s*\d+)?$", re.IGNORECASE)
 
 
 def _is_footer_text(joined_lower):
+    if _PAGE_LINE_RE.match(joined_lower.strip()):
+        return True
     return any(marker in joined_lower for marker in FOOTER_MARKERS)
 
 
@@ -204,16 +220,20 @@ def _line_has_date_token(line):
 # adjacent wrapped line (e.g. "Cheque" / "No/Reference" stacked).
 # ---------------------------------------------------------------------------
 
-def _line_keyword_score(line):
+def _line_keyword_score(line, header_hints=None):
     score = 0
     for w in line:
         t = w["text"].lower().strip(":.")
         if any(t == k or t.startswith(k) for k in HEADER_KEYWORDS):
             score += 1
+        # Bank-profile hints (see banks.py) only nudge ties -- they never
+        # make a non-header line win on their own.
+        if header_hints and any(t == k or t.startswith(k) for k in header_hints):
+            score += 0.5
     return score
 
 
-def _find_header_lines(lines, max_gap=12):
+def _find_header_lines(lines, max_gap=12, header_hints=None):
     """
     Returns (header_line_groups, data_start_idx) where header_line_groups is
     a list of physical lines (each a list of words) that together make up
@@ -222,7 +242,14 @@ def _find_header_lines(lines, max_gap=12):
     """
     best_idx, best_score = None, 0
     for idx, line in enumerate(lines):
-        score = _line_keyword_score(line)
+        score = _line_keyword_score(line, header_hints)
+        if score < 3:
+            continue
+        # A summary box ("Opening Balance | Total Debit Amount | ...")
+        # can score as high as the real column header. The real header is
+        # followed within a few lines by dated transaction rows.
+        if any(_line_has_date_token(l) for l in lines[idx + 1: idx + 4]):
+            score += 3
         if score > best_score:
             best_score, best_idx = score, idx
     if best_idx is None or best_score < 3:
@@ -394,7 +421,7 @@ def _build_columns(header_line_groups, page_width, merge_gap):
         label = " ".join(w["text"].strip().rstrip(".:—-").split())
         label = re.sub(r"\s*/\s*", "/", label)
         columns.append({"label": label or f"Col{i+1}", "x_start": start, "x_end": end,
-                        "_hx": (w["x0"] + w["x1"]) / 2})
+                        "_hx": (w["x0"] + w["x1"]) / 2, "_lx0": w["x0"]})
     return columns
 
 
@@ -413,7 +440,16 @@ def _refine_boundaries_from_data(columns, lines, header_line_count=0):
     whitespace gap between the two neighbouring header labels. Boundaries
     that already sit in whitespace are left untouched.
     """
-    data_lines = [ln for ln in lines if _line_has_date_token(ln)]
+    # Only look at the transaction table itself: stop at the first footer
+    # line ("END OF STATEMENT", disclaimers...), whose "Statement Generated
+    # On : 14-Sep-2026" style text would otherwise count as a dated row and
+    # bridge the whitespace gaps between columns.
+    table_lines = []
+    for ln in lines:
+        if _is_footer_text(" ".join(w["text"] for w in ln).lower()):
+            break
+        table_lines.append(ln)
+    data_lines = [ln for ln in table_lines if _line_has_date_token(ln)]
     if len(data_lines) < 3 or len(columns) < 2:
         return columns
     words = [w for ln in data_lines for w in ln]
@@ -425,7 +461,7 @@ def _refine_boundaries_from_data(columns, lines, header_line_count=0):
             cover[x] += 1
     # A column separator may be crossed by an occasional over-long word;
     # treat x as whitespace if only a few percent of words touch it.
-    thresh = max(0, int(len(data_lines) * 0.03))
+    thresh = max(1, int(len(data_lines) * 0.03))
 
     def is_gap(x):
         i = int(x) - min_x
@@ -434,7 +470,7 @@ def _refine_boundaries_from_data(columns, lines, header_line_count=0):
     columns = [dict(c) for c in columns]
     for i in range(1, len(columns)):
         b = columns[i]["x_start"]
-        if is_gap(b):
+        if columns[i].get("_ruled") or is_gap(b):
             continue
         lo = columns[i - 1].get("_hx", columns[i - 1]["x_start"])
         hi = columns[i].get("_hx", b)
@@ -456,6 +492,43 @@ def _refine_boundaries_from_data(columns, lines, header_line_count=0):
             columns[i]["x_start"] = nb
             columns[i - 1]["x_end"] = nb
     return columns
+
+
+def _snap_boundaries_to_rulings(columns, header_line_groups, v_rulings):
+    """
+    Bordered statements (CSB, many private banks) draw a vertical rule
+    between every column. When those rules are present in the PDF's vector
+    layer they are the exact column boundaries -- far more reliable than
+    header-label midpoints, which cut through right-aligned amounts. For
+    each boundary, take the ruling that sits just left of the column's
+    header label (and right of the previous label). Boundaries without a
+    matching ruling are left as they were.
+    Returns (columns, snapped_count).
+    """
+    if not v_rulings or len(columns) < 2:
+        return columns, 0
+    hdr_top = min(w["top"] for ln in header_line_groups for w in ln)
+    hdr_bottom = max(w["bottom"] for ln in header_line_groups for w in ln)
+    xs = sorted({round(r["x"], 1) for r in v_rulings
+                 if r["top"] <= hdr_bottom + 2 and r["bottom"] >= hdr_top - 2})
+    if len(xs) < 2:
+        return columns, 0
+    columns = [dict(c) for c in columns]
+    snapped = 0
+    for i in range(1, len(columns)):
+        label_x0 = columns[i].get("_lx0")
+        prev_x0 = columns[i - 1].get("_lx0")
+        if label_x0 is None or prev_x0 is None:
+            continue
+        cands = [x for x in xs if prev_x0 + 2 < x <= label_x0 + 2]
+        if not cands:
+            continue
+        nb = max(cands)
+        columns[i]["x_start"] = nb
+        columns[i - 1]["x_end"] = nb
+        columns[i]["_ruled"] = True
+        snapped += 1
+    return columns, snapped
 
 
 _REF_COLUMN_KEYWORDS = ("chq", "cheque", "ref", "reference", "no/reference")
@@ -1034,14 +1107,16 @@ def _is_prose_line(row, columns):
 
 
 def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None, ocr_context=None,
-                        refine_from_data=False):
+                        refine_from_data=False, v_rulings=None, header_hints=None):
     lines = _group_words_into_lines(words, y_tol=y_tol)
-    header_line_groups, data_start = _find_header_lines(lines)
+    header_line_groups, data_start = _find_header_lines(lines, header_hints=header_hints)
 
     if header_line_groups is not None:
         columns = _build_columns(header_line_groups, page_width, merge_gap)
         columns = _ensure_reference_column(columns, locked_columns)
         columns = _relabel_columns_from_locked(columns, locked_columns)
+        if v_rulings:
+            columns, _ = _snap_boundaries_to_rulings(columns, header_line_groups, v_rulings)
         if refine_from_data:
             columns = _refine_boundaries_from_data(columns, lines[data_start:])
     elif locked_columns is not None:
@@ -1069,6 +1144,13 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
             break
 
         row, row_words = _assign_line_to_columns(line, columns)
+        if current is not None:
+            for dl in date_labels:
+                cur_d = current.get(dl, "")
+                toks = row.get(dl, "").split()
+                if cur_d and DATE_HEAD_RE.match(cur_d) and toks and YEAR_TAIL_RE.match(toks[0]):
+                    current[dl] = cur_d + toks[0]
+                    row[dl] = " ".join(toks[1:])
         if not _looks_like_date(row.get(primary_date_label, "")) and _is_prose_line(row, columns):
             continue
         row = _refine_low_confidence_cells(row, row_words, columns, date_labels, ocr_context)
@@ -1225,12 +1307,18 @@ def _words_from_ocr(page, dpi=250):
 # Per-page orchestration
 # ---------------------------------------------------------------------------
 
-def extract_page(page, locked_columns=None):
+def extract_page(page, locked_columns=None, header_hints=None):
     has_chars = len(page.chars) > 0
     ocr_context = None
 
+    v_rulings = None
     if has_chars:
         words = _words_from_text_layer(page)
+        try:
+            v_rulings = [{"x": e["x0"], "top": e["top"], "bottom": e["bottom"]}
+                         for e in page.edges if e.get("orientation") == "v"]
+        except Exception:
+            v_rulings = None
         method = "text"
         y_tol, merge_gap = 3, 6
     else:
@@ -1241,7 +1329,8 @@ def extract_page(page, locked_columns=None):
 
     header, rows, columns = _extract_structured(
         words, page.width, y_tol=y_tol, merge_gap=merge_gap, locked_columns=locked_columns,
-        ocr_context=ocr_context, refine_from_data=(method == "text"),
+        ocr_context=ocr_context, refine_from_data=(method == "text"), v_rulings=v_rulings,
+        header_hints=header_hints,
     )
     if header is None:
         return {"type": "none"}, method, locked_columns
@@ -1249,14 +1338,15 @@ def extract_page(page, locked_columns=None):
     return {"type": "structured", "header": header, "rows": rows}, method, columns
 
 
-def process_pdf(pdf_path, progress_callback=None):
+def process_pdf(pdf_path, progress_callback=None, header_hints=None):
     results = {}
     methods = {}
     locked_columns = None
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         for i, page in enumerate(pdf.pages):
-            page_result, method, columns_used = extract_page(page, locked_columns=locked_columns)
+            page_result, method, columns_used = extract_page(page, locked_columns=locked_columns,
+                                                             header_hints=header_hints)
             if locked_columns is None and columns_used is not None:
                 locked_columns = columns_used
             results[i + 1] = page_result
@@ -1267,21 +1357,22 @@ def process_pdf(pdf_path, progress_callback=None):
 
 
 def _process_single_page(args):
-    pdf_path, page_index, locked_columns = args
+    pdf_path, page_index, locked_columns, header_hints = args
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_index]
-        page_result, method, columns_used = extract_page(page, locked_columns=locked_columns)
+        page_result, method, columns_used = extract_page(page, locked_columns=locked_columns,
+                                                         header_hints=header_hints)
     return page_index, page_result, method
 
 
-def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None):
+def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None, header_hints=None):
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         first_page = pdf.pages[0]
-        first_result, first_method, locked_columns = extract_page(first_page)
+        first_result, first_method, locked_columns = extract_page(first_page, header_hints=header_hints)
 
     results = {1: first_result}
     methods = {1: first_method}
@@ -1295,7 +1386,7 @@ def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None):
     if max_workers is None:
         max_workers = max(1, (os.cpu_count() or 2) - 1)
 
-    tasks = [(pdf_path, idx, locked_columns) for idx in range(1, total)]
+    tasks = [(pdf_path, idx, locked_columns, header_hints) for idx in range(1, total)]
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_process_single_page, t) for t in tasks]
         for future in as_completed(futures):
@@ -1329,7 +1420,7 @@ def _find_column_label(header, keywords):
     return next((h for h in header if any(k in h.lower() for k in keywords)), None)
 
 
-_SINGLE_SIGNED_AMOUNT_RE = re.compile(r"^([\d,]+\.\d{2})\s*(cr|dr)?$", re.IGNORECASE)
+_SINGLE_SIGNED_AMOUNT_RE = re.compile(r"^(-?[\d,]+\.\d{2})\s*\(?(cr|dr)?\)?$", re.IGNORECASE)
 _SINGLE_PLAIN_AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$")
 
 
@@ -1350,7 +1441,9 @@ def _parse_signed_balance(text):
         v = float(m.group(1).replace(",", ""))
     except ValueError:
         return None
-    return -v if (m.group(2) or "").lower() == "dr" else v
+    # A leading minus (CSB prints an overdrawn balance as "-4,023.44") is
+    # already the sign; a Dr suffix flips a positive figure.
+    return -abs(v) if (m.group(2) or "").lower() == "dr" else v
 
 
 def _parse_clean_amount(text):
@@ -1611,6 +1704,36 @@ def _split_merged_transaction_rows(rows, debit_label, credit_label, balance_labe
     return out
 
 
+def _merge_page_break_continuations(results, header, particulars_label):
+    """
+    A transaction's narration can wrap past the bottom of a page, so the
+    next page starts with a line or two of text that has no date and no
+    amounts (CSB: "(Q70545" alone at the top of page 3). Within one page
+    that is handled as a continuation line, but across pages it would
+    otherwise become a fake, empty transaction row. Glue such leading
+    orphan rows onto the previous page's last real row instead.
+    """
+    if not header or not particulars_label:
+        return
+    prev_last = None
+    for page_num in sorted(results.keys()):
+        res = results[page_num]
+        if res.get("type") != "structured":
+            continue
+        rows = res["rows"]
+        while rows and prev_last is not None:
+            r = rows[0]
+            others = [v for k, v in r.items()
+                      if k not in (particulars_label, _NEEDS_REVIEW_KEY) and v]
+            text = (r.get(particulars_label) or "").strip()
+            if others or not text:
+                break
+            prev_last[particulars_label] = f"{prev_last.get(particulars_label, '')} {text}".strip()
+            rows.pop(0)
+        if rows:
+            prev_last = rows[-1]
+
+
 def write_excel(results, output_path, merge_pages=True):
     from openpyxl.styles import PatternFill, Font
 
@@ -1625,6 +1748,8 @@ def write_excel(results, output_path, merge_pages=True):
     balance_label = _find_column_label(header, ("balance",))
     particulars_label = _find_column_label(header, ("particular", "narration", "description", "detail"))
     date_labels_for_split = [h for h in (header or []) if "date" in h.lower()] or ([header[0]] if header else [])
+
+    _merge_page_break_continuations(results, header, particulars_label)
 
     for page_num, res in results.items():
         if res.get("type") == "structured":
@@ -1654,6 +1779,9 @@ def write_excel(results, output_path, merge_pages=True):
 
     def row_flag(row):
         return bool(row.get(_NEEDS_REVIEW_KEY, False))
+
+    summary = _compute_summary(all_rows_in_doc_order, header, debit_label, credit_label,
+                               balance_label, particulars_label)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         if merge_pages:
@@ -1700,6 +1828,41 @@ def write_excel(results, output_path, merge_pages=True):
                 used_names.add(sheet_name)
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
                 _style_review_column(writer.sheets[sheet_name], flags, header_font, review_fill)
+
+    return summary
+
+
+_OPENING_ROW_RE = re.compile(r"^\s*(b/f|brought forward|opening balance)\b", re.IGNORECASE)
+
+
+def _compute_summary(rows, header, debit_label, credit_label, balance_label, particulars_label):
+    """Totals of what was actually extracted, for the UI's result card and
+    the cross-check against the statement's own printed totals."""
+    def amt(text):
+        if not text:
+            return 0.0
+        v = _parse_clean_amount(text.strip())
+        return v if v is not None else 0.0
+
+    debits = credits = 0.0
+    closing = None
+    for r in rows:
+        is_opening = bool(particulars_label and _OPENING_ROW_RE.match(r.get(particulars_label, "") or ""))
+        if not is_opening:
+            debits += amt(r.get(debit_label, "")) if debit_label else 0.0
+            credits += amt(r.get(credit_label, "")) if credit_label else 0.0
+        if balance_label:
+            b = _parse_signed_balance(r.get(balance_label, ""))
+            if b is not None:
+                closing = b
+    return {
+        "rows": len(rows),
+        "needs_review": sum(1 for r in rows if r.get(_NEEDS_REVIEW_KEY)),
+        "header": list(header or []),
+        "debits": round(debits, 2) if debit_label else None,
+        "credits": round(credits, 2) if credit_label else None,
+        "closing": round(closing, 2) if closing is not None else None,
+    }
 
 
 def _style_review_column(worksheet, flags, header_font, review_fill):

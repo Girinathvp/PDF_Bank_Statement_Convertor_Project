@@ -2,45 +2,144 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Bank Statement PDF → Excel Converter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Statement Converter</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="card">
-    <h1>PDF Bank Statement → Excel</h1>
-    <p class="subtitle">Works with lined tables, unlined (spaced-text) tables, and scanned statements (via OCR).</p>
+<div class="shell">
 
-    <div id="dropzone" class="dropzone">
-      <p>Drag &amp; drop a PDF here, or click to browse</p>
-      <input type="file" id="fileInput" accept="application/pdf" hidden>
-    </div>
-
-    <div id="fileInfo" class="file-info hidden"></div>
-
-    <div class="option-row">
-      <label class="toggle">
-        <input type="checkbox" id="mergeToggle" checked>
-        <span>Merge all pages into a single Excel sheet</span>
-      </label>
-      <p class="hint" id="toggleHint">Unchecked = each PDF page becomes its own Excel tab.</p>
-    </div>
-
-    <button id="convertBtn" class="primary-btn" disabled>Convert to Excel</button>
-
-    <div id="progressSection" class="progress-section hidden">
-      <div class="progress-bar">
-        <div id="progressFill" class="progress-fill"></div>
+  <aside class="rail">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+        <rect x="6" y="5" width="22" height="29" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M11 13h12M11 18h12M11 23h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <rect x="20" y="20" width="15" height="15" rx="2" fill="#B08D57"/>
+        <path d="M24 24l7 7M31 24l-7 7" stroke="#14213D" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1>Statement Converter</h1>
+        <p class="tagline">Bank statement PDFs to clean Excel ledgers</p>
       </div>
-      <p id="progressLabel">Starting…</p>
     </div>
 
-    <div id="resultSection" class="result-section hidden">
-      <a id="downloadLink" class="primary-btn" download>Download Excel file</a>
-    </div>
+    <section class="guide" aria-labelledby="guideTitle">
+      <h2 id="guideTitle">How it works</h2>
+      <ol class="steps">
+        <li>
+          <h3>Pick your bank</h3>
+          <p>Choose the bank that issued the statement. We also read the IFSC on page one and suggest the bank if it differs. Not listed? Use “Other bank” and the layout is worked out from the PDF itself.</p>
+        </li>
+        <li>
+          <h3>Add the statement</h3>
+          <p>Drop a PDF downloaded from net banking, or a scanned copy. Scanned pages are read with OCR and take longer, around 1–2 seconds per page.</p>
+        </li>
+        <li>
+          <h3>Convert</h3>
+          <p>Every page is read row by row. Dates, narration, cheque numbers, debits, credits and balance land in their own columns.</p>
+        </li>
+        <li>
+          <h3>Check the result</h3>
+          <p>We add up the debits and credits and compare them with the totals printed on the statement. Rows we could not read with confidence are highlighted in amber in the Excel file.</p>
+        </li>
+      </ol>
+      <div class="guide-notes">
+        <h3>Good to know</h3>
+        <ul>
+          <li>Password-protected PDFs need to be unlocked first.</li>
+          <li>Files are deleted from the server within an hour.</li>
+          <li>Turn off “one sheet” to get each PDF page on its own Excel tab.</li>
+        </ul>
+      </div>
+    </section>
+  </aside>
 
-    <div id="errorBox" class="error-box hidden"></div>
-  </div>
+  <main class="work">
 
-  <script src="/static/script.js"></script>
+    <section class="block" aria-labelledby="bankTitle">
+      <div class="block-head">
+        <h2 id="bankTitle"><span class="num">1</span>Bank</h2>
+        <p id="bankNote" class="block-note">Selected: <strong id="bankSelectedName">Other bank</strong></p>
+      </div>
+      <div id="bankGrid" class="bank-grid" role="radiogroup" aria-label="Verified banks"></div>
+      <details id="betaWrap" class="beta">
+        <summary>More banks <span class="beta-tag">beta</span></summary>
+        <div id="betaGrid" class="bank-grid bank-grid--beta" role="radiogroup" aria-label="Beta banks"></div>
+      </details>
+      <div id="detectNotice" class="notice hidden" role="status"></div>
+    </section>
+
+    <section class="block" aria-labelledby="fileTitle">
+      <div class="block-head">
+        <h2 id="fileTitle"><span class="num">2</span>Statement</h2>
+      </div>
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Choose a PDF statement">
+        <svg viewBox="0 0 48 48" aria-hidden="true" class="dz-icon">
+          <path d="M14 6h14l10 10v24a2 2 0 0 1-2 2H14a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M28 6v10h10" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M24 34V22M19 27l5-5 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <p class="dz-main">Drop the PDF here, or <u>browse</u></p>
+        <p class="dz-sub">Digital or scanned statements, up to 300 MB</p>
+        <input type="file" id="fileInput" accept="application/pdf" hidden>
+      </div>
+      <div id="fileInfo" class="file-card hidden">
+        <div class="file-name" id="fileName"></div>
+        <div class="file-meta" id="fileMeta"></div>
+      </div>
+    </section>
+
+    <section class="block" aria-labelledby="convTitle">
+      <div class="block-head">
+        <h2 id="convTitle"><span class="num">3</span>Convert</h2>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="mergeToggle" checked>
+        <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+        <span>Put all pages on one Excel sheet</span>
+      </label>
+      <button id="convertBtn" class="btn btn-primary" disabled>Convert to Excel</button>
+
+      <div id="progressSection" class="progress hidden" aria-live="polite">
+        <div class="progress-top">
+          <div>
+            <div class="eta" id="etaText">Estimating…</div>
+            <div class="progress-sub" id="progressSub">Starting</div>
+          </div>
+          <div class="pct" id="pctText">0%</div>
+        </div>
+        <div class="ledger" id="ledger" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Pages converted"></div>
+        <ol class="stages" id="stages">
+          <li data-stage="reading">Reading PDF</li>
+          <li data-stage="extracting">Extracting pages</li>
+          <li data-stage="writing">Building Excel</li>
+          <li data-stage="validating">Checking totals</li>
+        </ol>
+        <div class="tips" aria-label="Tips">
+          <span class="tips-label">Tip</span>
+          <div class="tips-window"><div class="tips-roll" id="tipsRoll"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="resultSection" class="block result hidden" aria-labelledby="resultTitle">
+      <div class="block-head">
+        <h2 id="resultTitle"><span class="num">4</span>Result</h2>
+        <p class="block-note" id="resultTime"></p>
+      </div>
+      <div class="figures" id="figures"></div>
+      <ul class="checks" id="checks"></ul>
+      <ul class="warnings" id="warnings"></ul>
+      <div class="actions">
+        <a id="downloadLink" class="btn btn-primary" download>Download Excel</a>
+        <button id="againBtn" class="btn btn-quiet" type="button">Convert another statement</button>
+      </div>
+    </section>
+
+    <div id="errorBox" class="error hidden" role="alert"></div>
+  </main>
+</div>
+
+<script src="/static/script.js"></script>
 </body>
 </html>

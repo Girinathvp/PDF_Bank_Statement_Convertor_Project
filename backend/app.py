@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, send_file, render_template, Response
 from werkzeug.utils import secure_filename
 
 from extractor import get_page_count, estimate_tat, process_pdf, process_pdf_parallel, write_excel
+import banks
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -98,6 +99,17 @@ def robots():
     return app.send_static_file("robots.txt")
 
 
+@app.route("/api/banks", methods=["GET"])
+def bank_list():
+    return jsonify({"banks": banks.public_bank_list()})
+
+
+def _output_name(original_filename):
+    base = os.path.splitext(os.path.basename(original_filename or ""))[0].strip() or "statement"
+    base = "".join(ch for ch in base if ch not in '\\/:*?"<>|').strip() or "statement"
+    return f"{base}.xlsx"
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload():
     if "file" not in request.files:
@@ -120,7 +132,10 @@ def upload():
         os.remove(saved_path)
         return jsonify({"error": f"Could not read PDF: {e}"}), 400
 
-    tat_seconds = estimate_tat(num_pages)
+    detected_bank, is_scanned, detect_reason = banks.detect_bank(saved_path)
+    if not is_scanned:
+        is_scanned = banks.likely_scanned(saved_path)
+    tat_seconds = estimate_tat(num_pages, likely_ocr=is_scanned)
     if USE_PARALLEL:
         cores = max(1, (os.cpu_count() or 2) - 1)
         tat_seconds = max(3, round(tat_seconds / cores))
@@ -135,6 +150,15 @@ def upload():
             "tat_seconds": tat_seconds,
             "output_path": None,
             "error": None,
+            "original_name": file.filename,
+            "download_name": _output_name(file.filename),
+            "is_scanned": is_scanned,
+            "detected_bank": detected_bank,
+            "stage": "uploaded",
+            "started_at": None,
+            "extract_started_at": None,
+            "finished_at": None,
+            "result": None,
         }
 
     return jsonify(
@@ -142,32 +166,97 @@ def upload():
             "job_id": job_id,
             "num_pages": num_pages,
             "estimated_seconds": tat_seconds,
+            "is_scanned": is_scanned,
+            "detected_bank": detected_bank,
+            "detect_reason": detect_reason,
+            "download_name": _output_name(file.filename),
         }
     )
 
 
-def _run_job(job_id, merge_pages):
+def _set_stage(job_id, stage):
+    with jobs_lock:
+        jobs[job_id]["stage"] = stage
+
+
+def _run_job(job_id, merge_pages, bank_id):
     with jobs_lock:
         job = jobs[job_id]
         job["status"] = "processing"
+        job["stage"] = "reading"
+        job["pages_done"] = 0
+        job["started_at"] = time.time()
+        job["extract_started_at"] = None
+        job["finished_at"] = None
+        job["result"] = None
+        job["error"] = None
+        job["bank"] = bank_id
         pdf_path = job["file_path"]
+        detected = job.get("detected_bank")
+
+    profile = banks.get_profile(bank_id)
 
     def progress_cb(done, total):
         with jobs_lock:
-            jobs[job_id]["pages_done"] = done
+            j = jobs[job_id]
+            if j["extract_started_at"] is None:
+                j["extract_started_at"] = j["started_at"]
+            j["pages_done"] = done
+            j["stage"] = "extracting"
 
     try:
-        runner = process_pdf_parallel if USE_PARALLEL else process_pdf
-        results, methods = runner(pdf_path, progress_callback=progress_cb)
-        output_path = os.path.join(OUTPUT_DIR, f"{job_id}.xlsx")
-        write_excel(results, output_path, merge_pages=merge_pages)
         with jobs_lock:
-            jobs[job_id]["status"] = "done"
-            jobs[job_id]["output_path"] = output_path
-            jobs[job_id]["methods"] = methods
+            jobs[job_id]["stage"] = "extracting"
+            jobs[job_id]["extract_started_at"] = time.time()
+        runner = process_pdf_parallel if USE_PARALLEL else process_pdf
+        results, methods = runner(pdf_path, progress_callback=progress_cb,
+                                  header_hints=profile.get("header_hints") or None)
+
+        _set_stage(job_id, "writing")
+        output_path = os.path.join(OUTPUT_DIR, f"{job_id}.xlsx")
+        summary = write_excel(results, output_path, merge_pages=merge_pages) or {}
+
+        _set_stage(job_id, "validating")
+        printed = banks.read_printed_summary(pdf_path)
+        checks = banks.compare_totals(printed, summary)
+        warnings = []
+        if detected and bank_id not in ("other", detected):
+            warnings.append(
+                f"You selected {profile['name']}, but this statement looks like "
+                f"{banks.get_profile(detected)['name']}. Check the output or re-run with that bank."
+            )
+        layout_ok = banks.header_matches_profile(summary.get("header"), profile)
+        if layout_ok is False:
+            warnings.append(f"Column layout differs from the usual {profile['name']} format. Please review the output.")
+        if not summary.get("rows"):
+            warnings.append("No transaction rows were found. Try 'Other bank (auto-detect layout)'.")
+        if profile.get("status") == "beta":
+            warnings.append(f"{profile['name']} support is in beta. Please spot-check a few rows.")
+
+        with jobs_lock:
+            j = jobs[job_id]
+            j["status"] = "done"
+            j["stage"] = "done"
+            j["finished_at"] = time.time()
+            j["output_path"] = output_path
+            j["methods"] = methods
+            j["result"] = {
+                "rows": summary.get("rows", 0),
+                "needs_review": summary.get("needs_review", 0),
+                "columns": summary.get("header", []),
+                "debits": summary.get("debits"),
+                "credits": summary.get("credits"),
+                "closing": summary.get("closing"),
+                "checks": checks,
+                "warnings": warnings,
+                "bank": {"id": profile["id"], "name": profile["name"], "status": profile["status"]},
+                "ocr_pages": sum(1 for m in methods.values() if m == "ocr"),
+                "seconds": round(j["finished_at"] - j["started_at"], 1),
+            }
     except Exception as e:
         with jobs_lock:
             jobs[job_id]["status"] = "error"
+            jobs[job_id]["stage"] = "error"
             jobs[job_id]["error"] = str(e)
 
 
@@ -181,8 +270,9 @@ def process(job_id):
 
     data = request.get_json(silent=True) or {}
     merge_pages = bool(data.get("merge_pages", True))
+    bank_id = banks.get_profile(data.get("bank"))["id"]
 
-    thread = threading.Thread(target=_run_job, args=(job_id, merge_pages), daemon=True)
+    thread = threading.Thread(target=_run_job, args=(job_id, merge_pages, bank_id), daemon=True)
     thread.start()
 
     return jsonify({"status": "started"})
@@ -194,15 +284,48 @@ def status(job_id):
         job = jobs.get(job_id)
         if not job:
             return jsonify({"error": "Unknown job_id"}), 404
+        now = time.time()
+        started = job.get("started_at")
+        elapsed = (job.get("finished_at") or now) - started if started else 0.0
         return jsonify(
             {
                 "status": job["status"],
+                "stage": job.get("stage"),
                 "pages_done": job["pages_done"],
                 "total_pages": job["total_pages"],
                 "estimated_seconds": job["tat_seconds"],
+                "elapsed_seconds": round(elapsed, 1),
+                "eta_seconds": _live_eta(job, now),
+                "is_scanned": job.get("is_scanned"),
+                "result": job.get("result"),
                 "error": job["error"],
             }
         )
+
+
+def _live_eta(job, now):
+    """
+    Remaining-time estimate that starts from the upload-time guess and
+    shifts to the measured pace as pages complete. After ~5 pages it is
+    driven entirely by the real seconds-per-page on this machine.
+    """
+    if job["status"] != "processing" or not job.get("started_at"):
+        return 0 if job["status"] == "done" else None
+    total = max(1, job["total_pages"])
+    done = job["pages_done"]
+    remaining_pages = max(0, total - done)
+    tail = 1.5 + 0.01 * total  # writing Excel + totals check
+    elapsed = now - job["started_at"]
+    initial_remaining = max(0.0, job["tat_seconds"] - elapsed)
+    if job.get("stage") in ("writing", "validating"):
+        return round(max(1.0, tail * 0.5), 1)
+    if done == 0:
+        return round(max(1.0, initial_remaining), 1)
+    ext_start = job.get("extract_started_at") or job["started_at"]
+    pace = (now - ext_start) / done
+    live = pace * remaining_pages + tail
+    w = min(1.0, done / 5.0)
+    return round(max(1.0, w * live + (1 - w) * initial_remaining), 1)
 
 
 @app.route("/api/download/<job_id>", methods=["GET"])
@@ -214,7 +337,7 @@ def download(job_id):
     return send_file(
         job["output_path"],
         as_attachment=True,
-        download_name="converted_statement.xlsx",
+        download_name=job.get("download_name") or "converted_statement.xlsx",
     )
 
 
