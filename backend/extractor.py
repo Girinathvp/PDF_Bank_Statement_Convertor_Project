@@ -31,14 +31,54 @@ column entirely, the locked version of that column is inserted back in
 using its known position.
 """
 
+import os
 import re
 import pdfplumber
 import pandas as pd
+
+# Tesseract's own OpenMP multi-threading is slower than single-threaded on
+# these page sizes, and in parallel mode its threads fight the page worker
+# processes for the same cores. Measured: one page 7.9s -> 2.1s, OCR output
+# byte-identical. Inherited by every tesseract subprocess pytesseract starts.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 
 # ---------------------------------------------------------------------------
 # Page counting / TAT estimation
 # ---------------------------------------------------------------------------
+
+def text_layer_flags(pdf_path, pages=None):
+    """
+    Per page: does it have a real text layer? Uses pdfium's text page, which
+    takes ~0.02-0.07s. pdfplumber's `len(page.chars)` gives the same answer
+    but makes pdfminer parse the whole page drawing first -- on the SIB/SBI
+    statements (text drawn as vector glyphs, no text layer) that alone cost
+    1.5-3.7s per page before OCR even started.
+    `pages` limits the check to those indices (others come back as None).
+    Returns None if pdfium can't open the file (caller falls back).
+    """
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(pdf_path)
+        try:
+            n = len(doc)
+            wanted = set(range(n)) if pages is None else {i for i in pages if 0 <= i < n}
+            flags = []
+            for i in range(n):
+                if i not in wanted:
+                    flags.append(None)
+                    continue
+                page = doc[i]
+                tp = page.get_textpage()
+                flags.append(tp.count_chars() > 0)
+                tp.close()
+                page.close()
+            return flags
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
 
 def get_page_count(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
@@ -245,6 +285,11 @@ def _find_header_lines(lines, max_gap=12, header_hints=None):
         score = _line_keyword_score(line, header_hints)
         if score < 3:
             continue
+        # A column header is mostly column words; a paragraph of small print
+        # ("...details, please visit Bank's website... balance in...") can
+        # contain three keywords but is mostly other words.
+        if _line_keyword_score(line) < 0.4 * len(line):
+            continue
         # A summary box ("Opening Balance | Total Debit Amount | ...")
         # can score as high as the real column header. The real header is
         # followed within a few lines by dated transaction rows.
@@ -266,6 +311,11 @@ def _find_header_lines(lines, max_gap=12, header_hints=None):
         if _line_has_date_token(line):
             return False
         if any(re.match(r"^[\d,]+\.\d{2}$", w["text"]) for w in line):
+            return False
+        # Header labels never carry money amounts, dates or long numbers;
+        # a garbled transaction line under the header (OCR junk around a
+        # real amount/date) must not be absorbed into it.
+        if any(re.search(r"\d\.\d{2}|\d{5,}|\d{2}[-/.]\d{2}[-/.]\d{2,4}", w["text"]) for w in line):
             return False
         return len(line) <= best_len
 
@@ -689,11 +739,91 @@ def _reocr_cell(crop_image, kind):
 
     whitelist = "0123456789-/." if kind == "date" else "0123456789,.CRDcrd "
     config = f"--psm 6 -c tessedit_char_whitelist={whitelist}"
+
+    key = (kind, crop_image.size, crop_image.tobytes())
+    if _REOCR_BATCH.get("recording") is not None:
+        _REOCR_BATCH["recording"].append((kind, config, crop_image, key))
+        return ""
+    cached = _REOCR_BATCH["cache"].get(key)
+    if cached is not None:
+        return cached
     try:
         text = pytesseract.image_to_string(crop_image, config=config)
     except Exception:
         return ""
     return " ".join(text.split())
+
+
+# Cell re-reads are batched per page: a dry run records every crop the page
+# will ask for, they are read in ONE Tesseract run per cell type (Tesseract
+# reads each image in a list independently -- same result as separate
+# calls), and the real run then picks the answers up from this cache. Saves
+# Tesseract's ~0.1s start-up on every one of the 10-50 re-reads per page.
+class _ReocrBatchState(__import__("threading").local):
+    # Per thread: the web app may convert two statements at once.
+    def __init__(self):
+        self.d = {"recording": None, "cache": {}}
+
+
+_REOCR_STATE = _ReocrBatchState()
+
+
+class _ReocrBatchProxy:
+    def __getitem__(self, k):
+        return _REOCR_STATE.d[k]
+
+    def __setitem__(self, k, v):
+        _REOCR_STATE.d[k] = v
+
+    def get(self, k, default=None):
+        return _REOCR_STATE.d.get(k, default)
+
+
+_REOCR_BATCH = _ReocrBatchProxy()
+
+
+def _batch_reocr(requests):
+    import os, tempfile, pytesseract
+    by_config = {}
+    for kind, config, img, key in requests:
+        if key not in _REOCR_BATCH["cache"]:
+            by_config.setdefault(config, {})[key] = img
+    for config, items in by_config.items():
+        keys = list(items)
+        if len(keys) == 1:
+            try:
+                txt = pytesseract.image_to_string(items[keys[0]], config=config)
+                _REOCR_BATCH["cache"][keys[0]] = " ".join(txt.split())
+            except Exception:
+                pass
+            continue
+        tmp = tempfile.mkdtemp(prefix="reocr_")
+        try:
+            paths = []
+            for n, k in enumerate(keys):
+                p = os.path.join(tmp, f"c{n:04d}.png")
+                items[k].save(p)
+                paths.append(p)
+            lst = os.path.join(tmp, "list.txt")
+            with open(lst, "w") as f:
+                f.write("\n".join(paths) + "\n")
+            out = pytesseract.image_to_string(lst, config=config)
+            parts = out.split("\f")
+            if len(parts) >= len(keys):
+                for k, part in zip(keys, parts):
+                    _REOCR_BATCH["cache"][k] = " ".join(part.split())
+        except Exception:
+            pass  # cache misses fall back to one call per cell
+        finally:
+            for fn in os.listdir(tmp):
+                try:
+                    os.remove(os.path.join(tmp, fn))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmp)
+            except OSError:
+                pass
 
 
 _NEEDS_REVIEW_KEY = "_needs_review"
@@ -778,10 +908,22 @@ def _refine_low_confidence_cells(row, row_words, columns, date_labels, ocr_conte
             targets.append((c["label"], "amount"))
 
     all_line_words = [w for ws in row_words.values() for w in ws]
+    # Blind date recovery is for a transaction line whose date glyphs OCR
+    # missed entirely. Such a line still carries its amounts/balance. A
+    # narration continuation line (text only) never has a date, so
+    # re-OCR'ing its date column is pure cost: measured on SIB/SBI it was
+    # 60-100% of all cell re-reads, none of which ever recovered anything.
+    line_has_amount = any(
+        re.search(r"\d\.\d{2}\b", w["text"])
+        for c in columns if any(k in c["label"].lower() for k in _AMOUNT_COLUMN_KEYWORDS)
+        for w in (row_words.get(c["label"]) or [])
+    )
     needs_review = False
     for label, kind in targets:
         ws = row_words.get(label) or []
         if not ws:
+            if kind == "date" and not line_has_amount:
+                continue  # continuation line: no date expected here
             if kind == "date" and all_line_words and ocr_context and ocr_context.get("image") is not None:
                 needs_review = _attempt_blind_date_recovery(
                     row, label, columns, all_line_words, ocr_context
@@ -916,12 +1058,17 @@ def _refine_low_confidence_cells(row, row_words, columns, date_labels, ocr_conte
     return row
 
 
+def _is_particulars_label(label):
+    """Narration column. Axis calls it just "Transaction" (ICICI:
+    "Transaction Remarks"); "Transaction Date/ID/Type" are not narration."""
+    low = (label or "").lower()
+    if any(k in low for k in ("particular", "narration", "description", "detail", "remark")):
+        return True
+    return "transaction" in low and not any(k in low for k in ("date", "id", "type", "no", "ref"))
+
+
 def _particulars_label(columns):
-    return next(
-        (c["label"] for c in columns
-         if any(k in c["label"].lower() for k in ("particular", "narration", "description", "detail"))),
-        None,
-    )
+    return next((c["label"] for c in columns if _is_particulars_label(c["label"])), None)
 
 
 def _final_validate_row(row, columns, date_labels):
@@ -1106,10 +1253,64 @@ def _is_prose_line(row, columns):
     return True
 
 
+def _has_amount(text):
+    """A real, non-zero money figure (not '0.00', not blank)."""
+    m = re.search(r"\d[\d,]*\.\d{2}", text or "")
+    return bool(m) and float(m.group(0).replace(",", "")) > 0
+
+
+def _is_page_total_echo(line_balance_text, row_balance_text):
+    """True when a continuation line's balance repeats the balance already
+    on the current row (same amount, any digit grouping / suffix)."""
+    def first_amount(t):
+        m = re.search(r"-?\d[\d,]*\.\d{2}", t or "")
+        return float(m.group(0).replace(",", "")) if m else None
+    a, b = first_amount(line_balance_text), first_amount(row_balance_text)
+    return a is not None and b is not None and abs(a - b) < 0.005
+
+
+def _has_transaction_line(lines, columns):
+    """Any line that is a real transaction under these columns: a date in
+    the date column and a money amount in an amount column."""
+    date_label = (_date_column_labels(columns) or [columns[0]["label"]])[0]
+    amount_labels = [c["label"] for c in columns
+                     if any(k in c["label"].lower() for k in _AMOUNT_COLUMN_KEYWORDS)]
+    for ln in lines:
+        row, _ = _assign_line_to_columns(ln, columns)
+        if _looks_like_date(row.get(date_label, "")) and any(
+                re.search(r"\d\.\d{2}", row.get(a, "")) for a in amount_labels):
+            return True
+    return False
+
+
 def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None, ocr_context=None,
-                        refine_from_data=False, v_rulings=None, header_hints=None):
+                        refine_from_data=False, v_rulings=None, header_hints=None, allow_header=True):
     lines = _group_words_into_lines(words, y_tol=y_tol)
-    header_line_groups, data_start = _find_header_lines(lines, header_hints=header_hints)
+    if allow_header:
+        header_line_groups, data_start = _find_header_lines(lines, header_hints=header_hints)
+    else:
+        header_line_groups, data_start = None, None
+
+    # Transactions ABOVE this page's header belong to the table continued
+    # from the previous page (Axis p3: the last two savings transactions,
+    # the savings "Closing Balance", then a Recurring Deposit table with
+    # its own header). Read them with the previous page's columns. If the
+    # main table closes there and the new header is a different table, the
+    # new table is another account and is left out.
+    pre_rows = []
+    if header_line_groups is not None and locked_columns is not None:
+        hs = min(i for i, ln in enumerate(lines) if any(ln is h for h in header_line_groups))
+        pre_lines = lines[:hs]
+        if _has_transaction_line(pre_lines, locked_columns):
+            _, pre_rows, _ = _extract_structured(
+                [w for ln in pre_lines for w in ln], page_width, y_tol, merge_gap,
+                locked_columns=locked_columns, ocr_context=ocr_context, header_hints=header_hints,
+                allow_header=False)
+            pre_rows = pre_rows or []
+            closed = any("closing" in " ".join(w["text"] for w in ln).lower() for ln in pre_lines)
+            new_labels = {c["label"] for c in _build_columns(header_line_groups, page_width, merge_gap)}
+            if pre_rows and closed and new_labels != {c["label"] for c in locked_columns}:
+                return [c["label"] for c in locked_columns], pre_rows, locked_columns
 
     if header_line_groups is not None:
         columns = _build_columns(header_line_groups, page_width, merge_gap)
@@ -1136,11 +1337,51 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
 
     date_labels = _date_column_labels(columns) or [columns[0]["label"]]
     primary_date_label = date_labels[0]
+
+    # Footer lines (Page Total, Grand Total...) found below the header. OCR
+    # can place part of a footer line a few points higher than its label --
+    # SIB's "Page Total : 83,917.00 1,71,208.00 ..." came back as
+    # "83,917.00" on its own line just above "Page Total :". That orphan was
+    # then merged into the page's last transaction as a phantom withdrawal.
+    # Anything in the same visual band as a footer line belongs to it.
+    footer_tops = [
+        _line_avg_top(ln) for ln in lines[data_start:]
+        if _is_footer_text(" ".join(w["text"] for w in ln).lower())
+    ]
+    band = y_tol * 1.5
+
+    # A continuation line (narration wrap, Cr suffix...) sits right under
+    # the line before it. Something far below the last consumed line that
+    # doesn't start a new transaction is page furniture -- e.g. the amounts
+    # of a "Page Total" row whose label OCR failed to read at all (SIB p5:
+    # a lone "83,917.00" 65pt below the last narration line, where real
+    # continuation lines are ~10pt apart).
+    # Typical distance from a line to its continuation line (the next line
+    # when that one does not start a new transaction).
+    region = lines[data_start:]
+    cont_gaps = sorted(
+        _line_avg_top(b) - _line_avg_top(a)
+        for a, b in zip(region, region[1:])
+        if not _line_has_date_token(b) and _line_avg_top(b) > _line_avg_top(a)
+    )
+    typical_gap = cont_gaps[len(cont_gaps) // 2] if cont_gaps else 12.0
+    max_continuation_gap = max(2.0 * typical_gap, 12.0)
+    particulars_lbl = _particulars_label(columns)
+    balance_lbl = next((c["label"] for c in columns if "balance" in c["label"].lower()), None)
+    debit_lbl = next((c["label"] for c in columns
+                      if any(k in c["label"].lower() for k in ("debit", "withdrawal"))), None)
+    credit_lbl = next((c["label"] for c in columns
+                       if any(k in c["label"].lower() for k in ("credit", "deposit"))), None)
+    last_top = None
+
     rows = []
     current = None
     for line in lines[data_start:]:
         joined_lower = " ".join(w["text"] for w in line).lower()
         if _is_footer_text(joined_lower):
+            break
+        top = _line_avg_top(line)
+        if any(0 <= ft - top <= band for ft in footer_tops):
             break
 
         row, row_words = _assign_line_to_columns(line, columns)
@@ -1162,10 +1403,29 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
                 current[_NEEDS_REVIEW_KEY] = _final_validate_row(current, columns, date_labels)
                 rows.append(current)
             current = row
+            last_top = top
         else:
             if current is None:
                 current = row
+                last_top = top
+            elif not (particulars_lbl and row.get(particulars_lbl)) and (
+                    (balance_lbl and _is_page_total_echo(row.get(balance_lbl, ""), current.get(balance_lbl, "")))
+                    or (debit_lbl and credit_lbl and _has_amount(row.get(debit_lbl)) and _has_amount(row.get(credit_lbl)))
+                    or (last_top is not None and top - last_top > max_continuation_gap)):
+                # No date, no narration, and its balance is the same figure
+                # as the transaction above: an unlabelled "Page Total" line
+                # (OCR missed the label; SIB prints the page's closing
+                # balance there). Merged in, it became a second deposit and
+                # balance on the row, which the row-splitter then turned
+                # into a fake transaction (e.g. a 22,89,712.00 "deposit").
+                # Same for a narration-free line carrying BOTH a withdrawal
+                # and a deposit (no single transaction has both; a totals
+                # line does), and for a narration-free fragment sitting
+                # detached below the transaction (stray amount or garbled
+                # totals piece; real continuation lines sit right below).
+                continue
             else:
+                last_top = top
                 current[_NEEDS_REVIEW_KEY] = bool(current.get(_NEEDS_REVIEW_KEY)) or bool(row.get(_NEEDS_REVIEW_KEY))
                 for label, val in row.items():
                     if label == _NEEDS_REVIEW_KEY:
@@ -1179,7 +1439,7 @@ def _extract_structured(words, page_width, y_tol, merge_gap, locked_columns=None
         rows.append(current)
 
     header_labels = [c["label"] for c in columns]
-    return header_labels, rows, columns
+    return header_labels, pre_rows + rows, columns
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +1520,122 @@ def _suppress_duplicate_words(words, top_tol=8, x_overlap_thresh=0.5):
     return sorted(kept, key=lambda w: w["top"])
 
 
+_JUNK_CHARS_RE = re.compile(r"[«»~=*“”‘’|<>{}\[\]_]")
+
+
+def _strip_thin_rules(img, min_cover=0.2, thin=3):
+    """Whiten thin horizontal rules (dashed or solid table lines) in an
+    image strip. A rule pixel has nothing dark a few pixels above and below
+    it, and such pixels cover a large share of the row; letters are much
+    taller than a rule, so text is left alone."""
+    import numpy as np
+    from PIL import Image as _PILImage
+    a = np.array(img.convert("L"))
+    dark = a < 128
+    up = np.zeros_like(dark)
+    dn = np.zeros_like(dark)
+    up[thin:] = dark[:-thin]
+    dn[:-thin] = dark[thin:]
+    thinpix = dark & ~up & ~dn
+    rule_rows = np.where(thinpix.sum(axis=1) >= min_cover * dark.shape[1])[0]
+    for r in rule_rows:
+        for rr in range(max(0, r - 1), min(dark.shape[0], r + 2)):
+            a[rr][thinpix[r]] = 255
+    return _PILImage.fromarray(a)
+
+
+def _repair_garbled_lines(words, pil_image, scale, y_tol=6):
+    """
+    A dashed table rule touching a text line can make Tesseract read the
+    whole line as junk at ~0 confidence (SIB p80: "(09-08-2026 ...
+    =SS*~*~S~«000.00=S«2872720.81" for "09-03-2026 ... 40000.00
+    2672710.41 Cr"), which loses the transaction. For each line holding
+    such a junk token, re-read just that strip with rule lines erased, and
+    keep the result only if it is clearly more confident. Clean lines are
+    never touched, so normal pages cost nothing extra.
+    """
+    if not words or pil_image is None:
+        return words
+    import pytesseract
+    out = []
+    changed = False
+    all_lines = _group_words_into_lines(words, y_tol)
+
+    def _centre(ln):
+        good = [w for w in ln if w.get("conf", 0) >= 50] or ln
+        return sum((w["top"] + w["bottom"]) / 2 for w in good) / len(good)
+
+    centres = [_centre(ln) for ln in all_lines]
+    for li, line in enumerate(all_lines):
+        # Only lines where junk hides a figure (an amount, balance or long
+        # number) are worth a re-read; garbled narration is left as read.
+        junk = any(
+            ((w.get("conf", 100) < 30 and len(w["text"]) >= 5) or len(_JUNK_CHARS_RE.findall(w["text"])) >= 3)
+            and re.search(r"\d[.,]\d{2}\b", w["text"])
+            for w in line
+        )
+        if not junk:
+            out.extend(line)
+            continue
+        top = min(w["top"] for w in line)
+        bottom = max(w["bottom"] for w in line)
+        py0 = max(0, int((top - 3) / scale))
+        py1 = min(pil_image.height, int((bottom + 3) / scale))
+        try:
+            strip = _strip_thin_rules(pil_image.crop((0, py0, pil_image.width, py1)))
+            d = pytesseract.image_to_data(strip, config="--psm 6", output_type=pytesseract.Output.DICT)
+        except Exception:
+            out.extend(line)
+            continue
+        new = []
+        for i, t in enumerate(d["text"]):
+            t = (t or "").strip()
+            try:
+                conf = float(d["conf"][i])
+            except (TypeError, ValueError):
+                conf = -1
+            if not t or conf < 0 or _GRIDLINE_ARTIFACT_RE.match(t):
+                continue
+            wt = py0 * scale + d["top"][i] * scale
+            wb = wt + d["height"][i] * scale
+            wc = (wt + wb) / 2
+            if not (top - 2 <= wc <= bottom + 2):
+                continue  # outside this line's band
+            # The strip can catch the neighbouring line of a two-line cell
+            # (~10pt apart). A word belongs to whichever line it sits
+            # closest to; if that is another line, that line already has it.
+            if any(abs(wc - c) < abs(wc - centres[li]) for k, c in enumerate(centres) if k != li):
+                continue
+            x0 = d["left"][i] * scale
+            new.append({"text": t, "x0": x0, "x1": x0 + d["width"][i] * scale,
+                        "top": wt, "bottom": wb, "conf": conf})
+        old_conf = sum(w.get("conf", 0) for w in line) / len(line)
+        new_conf = sum(w["conf"] for w in new) / len(new) if new else -1
+        if len(new) >= 2 and new_conf >= old_conf + 10 and not any(
+                len(_JUNK_CHARS_RE.findall(w["text"])) >= 3 for w in new):
+            out.extend(new)
+            changed = True
+        else:
+            out.extend(line)
+    return sorted(out, key=lambda w: w["top"]) if changed else words
+
+
+_SUMMARY_LABEL_RE = re.compile(r"grand\s+total|closing\s+balance|total\s+(debit|credit|withdrawal|deposit)", re.I)
+
+
+def _reread_strip_text(line, pil_image, scale):
+    """Plain-text re-read of one full-width line strip (rule lines erased)."""
+    import pytesseract
+    top = min(w["top"] for w in line)
+    bottom = max(w["bottom"] for w in line)
+    try:
+        strip = _strip_thin_rules(pil_image.crop(
+            (0, max(0, int((top - 3) / scale)), pil_image.width, min(pil_image.height, int((bottom + 3) / scale)))))
+        return " ".join(pytesseract.image_to_string(strip, config="--psm 7").split())
+    except Exception:
+        return ""
+
+
 def _words_from_ocr(page, dpi=250):
     import pytesseract
 
@@ -1307,8 +1683,8 @@ def _words_from_ocr(page, dpi=250):
 # Per-page orchestration
 # ---------------------------------------------------------------------------
 
-def extract_page(page, locked_columns=None, header_hints=None):
-    has_chars = len(page.chars) > 0
+def extract_page(page, locked_columns=None, header_hints=None, has_text=None):
+    has_chars = has_text if has_text is not None else len(page.chars) > 0
     ocr_context = None
 
     v_rulings = None
@@ -1323,30 +1699,63 @@ def extract_page(page, locked_columns=None, header_hints=None):
         y_tol, merge_gap = 3, 6
     else:
         words, ocr_image, ocr_scale = _words_from_ocr(page)
+        words = _repair_garbled_lines(words, ocr_image, ocr_scale)
         method = "ocr"
         y_tol, merge_gap = 6, 15
         ocr_context = {"image": ocr_image, "scale": ocr_scale}
 
-    header, rows, columns = _extract_structured(
-        words, page.width, y_tol=y_tol, merge_gap=merge_gap, locked_columns=locked_columns,
-        ocr_context=ocr_context, refine_from_data=(method == "text"), v_rulings=v_rulings,
-        header_hints=header_hints,
-    )
-    if header is None:
-        return {"type": "none"}, method, locked_columns
+    kwargs = dict(y_tol=y_tol, merge_gap=merge_gap, locked_columns=locked_columns,
+                  ocr_context=ocr_context, refine_from_data=(method == "text"), v_rulings=v_rulings,
+                  header_hints=header_hints)
+    if ocr_context is not None:
+        _REOCR_BATCH["recording"] = []
+        try:
+            import copy
+            _extract_structured(copy.deepcopy(words), page.width, **kwargs)
+            requests = _REOCR_BATCH["recording"]
+        finally:
+            _REOCR_BATCH["recording"] = None
+        _batch_reocr(requests)
+    try:
+        header, rows, columns = _extract_structured(words, page.width, **kwargs)
+    finally:
+        _REOCR_BATCH["cache"].clear()
+    # OCR'd page text, kept so a statement's printed summary (Grand Total,
+    # Closing Balance...) can be cross-checked on scanned statements too.
+    lines_text = None
+    if method == "ocr":
+        lines_text = []
+        for ln in _group_words_into_lines(words, y_tol):
+            text = " ".join(w["text"] for w in ln)
+            # A summary label whose figures OCR missed (SIB's "Grand Total"
+            # line came back as just the label): re-read that strip once.
+            if (_SUMMARY_LABEL_RE.search(text) and not re.search(r"\d\.\d{2}", text)
+                    and ocr_context is not None):
+                reread = _reread_strip_text(ln, ocr_context["image"], ocr_context["scale"])
+                if reread and re.search(r"\d\.\d{2}", reread):
+                    text = reread
+            lines_text.append(text)
 
-    return {"type": "structured", "header": header, "rows": rows}, method, columns
+    if header is None:
+        return {"type": "none", "lines_text": lines_text}, method, locked_columns
+
+    return {"type": "structured", "header": header, "rows": rows, "lines_text": lines_text}, method, columns
 
 
 def process_pdf(pdf_path, progress_callback=None, header_hints=None):
     results = {}
     methods = {}
     locked_columns = None
+    flags = text_layer_flags(pdf_path)
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         for i, page in enumerate(pdf.pages):
-            page_result, method, columns_used = extract_page(page, locked_columns=locked_columns,
-                                                             header_hints=header_hints)
+            page_result, method, columns_used = extract_page(
+                page, locked_columns=locked_columns, header_hints=header_hints,
+                has_text=flags[i] if flags and i < len(flags) else None)
+            # Release pdfplumber's per-page caches as we go; otherwise every
+            # parsed page stays in memory for the whole document.
+            page.close()
             if locked_columns is None and columns_used is not None:
                 locked_columns = columns_used
             results[i + 1] = page_result
@@ -1357,11 +1766,12 @@ def process_pdf(pdf_path, progress_callback=None, header_hints=None):
 
 
 def _process_single_page(args):
-    pdf_path, page_index, locked_columns, header_hints = args
+    pdf_path, page_index, locked_columns, header_hints, has_text = args
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_index]
         page_result, method, columns_used = extract_page(page, locked_columns=locked_columns,
-                                                         header_hints=header_hints)
+                                                         header_hints=header_hints, has_text=has_text)
+        page.close()
     return page_index, page_result, method
 
 
@@ -1369,10 +1779,13 @@ def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None, hea
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    flags = text_layer_flags(pdf_path)
+    flag = (lambda i: flags[i] if flags and i < len(flags) else None)
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         first_page = pdf.pages[0]
-        first_result, first_method, locked_columns = extract_page(first_page, header_hints=header_hints)
+        first_result, first_method, locked_columns = extract_page(first_page, header_hints=header_hints,
+                                                                  has_text=flag(0))
 
     results = {1: first_result}
     methods = {1: first_method}
@@ -1386,7 +1799,7 @@ def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None, hea
     if max_workers is None:
         max_workers = max(1, (os.cpu_count() or 2) - 1)
 
-    tasks = [(pdf_path, idx, locked_columns, header_hints) for idx in range(1, total)]
+    tasks = [(pdf_path, idx, locked_columns, header_hints, flag(idx)) for idx in range(1, total)]
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_process_single_page, t) for t in tasks]
         for future in as_completed(futures):
@@ -1405,13 +1818,19 @@ def process_pdf_parallel(pdf_path, progress_callback=None, max_workers=None, hea
 # ---------------------------------------------------------------------------
 
 def _canonical_header(results):
-    candidates = [
-        r["header"] for r in results.values()
-        if r.get("type") == "structured" and r.get("header")
-    ]
-    if not candidates:
+    """The statement's column header: the one used by the pages holding the
+    most transactions. (Taking the longest header let a paragraph of small
+    print that was mis-detected as a header on some back page win.)"""
+    from collections import Counter
+    weight = Counter()
+    for r in results.values():
+        if r.get("type") == "structured" and r.get("header"):
+            dated = sum(1 for row in r.get("rows", []) if any(
+                _looks_like_date(v) for k, v in row.items() if k != _NEEDS_REVIEW_KEY and "date" in k.lower()))
+            weight[tuple(r["header"])] += dated + 0.001 * len(r["header"])
+    if not weight:
         return None
-    return max(candidates, key=len)
+    return list(weight.most_common(1)[0][0])
 
 
 def _find_column_label(header, keywords):
@@ -1486,6 +1905,12 @@ def _format_signed_balance(value):
     return f"{s}.{frac_part:02d} {'Dr' if is_dr else 'Cr'}"
 
 
+def _format_plain_balance(value):
+    """Calculated balance for statements that print no Cr/Dr (Axis, HDFC):
+    Indian digit grouping, leading minus when overdrawn."""
+    return ("-" if value < 0 else "") + _format_amount(value)
+
+
 def _format_amount(value):
     """Format a corrected Debit/Credit value using standard Indian-style
     digit grouping, no Cr/Dr suffix (unlike Balance, these columns are
@@ -1507,7 +1932,8 @@ def _format_amount(value):
     return f"{s}.{frac_part:02d}"
 
 
-def _correct_balances_via_running_total(all_rows_in_order, debit_label, credit_label, balance_label, tolerance=1.0):
+def _correct_balances_via_running_total(all_rows_in_order, debit_label, credit_label, balance_label, tolerance=1.0,
+                                        with_suffix=True):
     """
     Walks the full transaction sequence in document order, cross-validating
     (and correcting, when confidently possible) each row's Balance against
@@ -1542,22 +1968,130 @@ def _correct_balances_via_running_total(all_rows_in_order, debit_label, credit_l
     if balance_label is None:
         return all_rows_in_order
 
+    def _amounts(r):
+        d = _parse_clean_amount(r.get(debit_label, "")) if debit_label else 0.0
+        c = _parse_clean_amount(r.get(credit_label, "")) if credit_label else 0.0
+        return d, c
+
+    def _residual(j):
+        """Printed-balance mismatch on the step into row j (None if any
+        value on that step can't be read)."""
+        if j <= 0 or j >= len(all_rows_in_order):
+            return None
+        pb = _parse_signed_balance(all_rows_in_order[j - 1].get(balance_label, ""))
+        b = _parse_signed_balance(all_rows_in_order[j].get(balance_label, ""))
+        d, c = _amounts(all_rows_in_order[j])
+        if None in (pb, b, d, c):
+            return None
+        return round(pb - d + c - b, 2)
+
+    def _bridge_residual(j):
+        """Mismatch from row j-1 to row j+1, skipping row j's balance."""
+        if j <= 0 or j + 1 >= len(all_rows_in_order):
+            return None
+        pb = _parse_signed_balance(all_rows_in_order[j - 1].get(balance_label, ""))
+        nb = _parse_signed_balance(all_rows_in_order[j + 1].get(balance_label, ""))
+        d1, c1 = _amounts(all_rows_in_order[j])
+        d2, c2 = _amounts(all_rows_in_order[j + 1])
+        if None in (pb, nb, d1, c1, d2, c2):
+            return None
+        return round(pb - d1 + c1 - d2 + c2 - nb, 2)
+
+    def _amount_misread(idx, prev_balance, own_balance, debit, credit, window=60):
+        """
+        The step into row idx doesn't add up. Two possible causes:
+          * this row's printed BALANCE is misread -- often for a run of
+            rows (e.g. a leading digit dropped on several balances in a
+            row); the run ends with an equal and opposite mismatch;
+          * this row's AMOUNT is misread -- the printed balances carry on
+            consistently and the mismatch is never "paid back".
+        Returns True only for the second case, and only when the corrected
+        amount is a believable misread of what was read.
+        """
+        r = round(prev_balance - (debit or 0.0) + (credit or 0.0) - own_balance, 2)
+        if abs(r) <= tolerance:
+            return False
+        held = 0
+        end = min(len(all_rows_in_order), idx + 1 + window)
+        j = idx + 1
+        while j < end:
+            rj = _residual(j)
+            if rj is None:
+                # Row j's balance is unreadable: bridge over it using the
+                # balances either side and both rows' amounts.
+                r2 = _bridge_residual(j)
+                if r2 is None:
+                    break
+                if abs(r2 + r) <= tolerance:
+                    return False
+                if abs(r2) > tolerance:
+                    break
+                held += 1
+                j += 2
+                continue
+            if abs(rj + r) <= tolerance:
+                return False          # paid back: a run of misread balances
+            if abs(rj) > tolerance:
+                # A single misread balance further on shows up as a pair of
+                # equal and opposite mismatches; step over it. Anything else
+                # is an unrelated problem: stop and don't guess.
+                rn = _residual(j + 1)
+                if rn is not None and abs(rj + rn) <= tolerance:
+                    held += 1
+                    j += 2
+                    continue
+                break
+            held += 1
+            j += 1
+        if held < 2:
+            return False              # not enough evidence the balances are right
+        true_amt = abs(own_balance - prev_balance)
+        read_amt = (debit or 0.0) + (credit or 0.0)
+        if read_amt == 0:
+            return True               # blank amount: certainly misread
+        # A misread amount differs from the truth in exactly one digit
+        # (15750 read as 18750); anything else is too uncertain to rewrite.
+        t, rd = f"{true_amt:.2f}", f"{read_amt:.2f}"
+        return len(t) == len(rd) and sum(x != y for x, y in zip(t, rd)) == 1
+
     prev_balance = None
-    for row in all_rows_in_order:
+    for idx, row in enumerate(all_rows_in_order):
         own_balance_text = row.get(balance_label, "")
         own_balance = _parse_signed_balance(own_balance_text)
-        debit = _parse_clean_amount(row.get(debit_label, "")) if debit_label else 0.0
-        credit = _parse_clean_amount(row.get(credit_label, "")) if credit_label else 0.0
+        debit, credit = _amounts(row)
 
         if prev_balance is not None and debit is not None and credit is not None:
             implied = prev_balance - debit + credit
             if own_balance is not None and abs(implied - own_balance) <= tolerance:
                 prev_balance = own_balance  # matches -- trust it as-is
+            elif own_balance is not None and _amount_misread(idx, prev_balance, own_balance, debit, credit):
+                # The printed balances are right and this row's AMOUNT was
+                # misread (SBI: credit 2,400.00 read as "400." -> blank;
+                # SIB: withdrawal 15750.00 read as 18750.00). Before this,
+                # the running total trusted the bad amount and rewrote every
+                # later balance to match it. Solve the amount from the two
+                # balances instead, and flag the row for a glance.
+                delta = round(own_balance - prev_balance, 2)
+                # Keep the statement's own number style (SIB prints amounts
+                # without digit grouping).
+                plain = not any("," in (r.get(debit_label, "") or "") + (r.get(credit_label, "") or "")
+                                for r in all_rows_in_order[max(0, idx - 5):idx + 5])
+                fmt = (lambda v: _format_amount(v).replace(",", "")) if plain else _format_amount
+                if delta > 0 and credit_label:
+                    row[credit_label] = fmt(delta)
+                    if debit_label and debit:
+                        row[debit_label] = ""
+                elif delta < 0 and debit_label:
+                    row[debit_label] = fmt(-delta)
+                    if credit_label and credit:
+                        row[credit_label] = ""
+                row[_NEEDS_REVIEW_KEY] = True
+                prev_balance = own_balance
             else:
                 # Either no usable Balance reading here, or it disagrees
                 # with the running total -- the derived value is more
                 # trustworthy given the reliability gap described above.
-                row[balance_label] = _format_signed_balance(implied)
+                row[balance_label] = _format_signed_balance(implied) if with_suffix else _format_plain_balance(implied)
                 prev_balance = implied
         elif prev_balance is not None and own_balance is not None and (debit is None) != (credit is None):
             # Exactly one of Debit/Credit is untrustworthy, but both
@@ -1746,7 +2280,7 @@ def write_excel(results, output_path, merge_pages=True):
     debit_label = _find_column_label(header, ("debit", "withdrawal"))
     credit_label = _find_column_label(header, ("credit", "deposit"))
     balance_label = _find_column_label(header, ("balance",))
-    particulars_label = _find_column_label(header, ("particular", "narration", "description", "detail"))
+    particulars_label = next((h for h in (header or []) if _is_particulars_label(h)), None)
     date_labels_for_split = [h for h in (header or []) if "date" in h.lower()] or ([header[0]] if header else [])
 
     _merge_page_break_continuations(results, header, particulars_label)
@@ -1762,16 +2296,21 @@ def write_excel(results, output_path, merge_pages=True):
         for page_num in sorted(results.keys())
         for row in (results[page_num]["rows"] if results[page_num].get("type") == "structured" else [])
     ]
+    # Judge the statement's own balance style from what the bank printed,
+    # before any calculated balances are filled in.
+    printed_balances = [r.get(balance_label, "") for r in all_rows_in_doc_order
+                        if balance_label and r.get(balance_label)]
+    uses_suffix = bool(printed_balances) and \
+        sum(1 for b in printed_balances if _has_cr_dr_suffix(b)) >= len(printed_balances) / 2
     if debit_label is not None and credit_label is not None:
-        _correct_balances_via_running_total(all_rows_in_doc_order, debit_label, credit_label, balance_label)
+        _correct_balances_via_running_total(all_rows_in_doc_order, debit_label, credit_label, balance_label,
+                                            with_suffix=uses_suffix)
 
     # Balance Cr/Dr suffix check, document-wide: only a statement that
     # normally prints a suffix on its balances (SIB, SBI, Federal) should
     # have a row flagged for missing one.
     if balance_label:
-        balances = [r.get(balance_label, "") for r in all_rows_in_doc_order if r.get(balance_label)]
-        with_suffix = sum(1 for b in balances if _has_cr_dr_suffix(b))
-        if balances and with_suffix >= len(balances) / 2:
+        if uses_suffix:
             for r in all_rows_in_doc_order:
                 b = r.get(balance_label, "")
                 if b and not _has_cr_dr_suffix(b):
@@ -1846,6 +2385,8 @@ def _compute_summary(rows, header, debit_label, credit_label, balance_label, par
 
     debits = credits = 0.0
     closing = None
+    opening = None
+    balances_seen = 0
     for r in rows:
         is_opening = bool(particulars_label and _OPENING_ROW_RE.match(r.get(particulars_label, "") or ""))
         if not is_opening:
@@ -1855,6 +2396,13 @@ def _compute_summary(rows, header, debit_label, credit_label, balance_label, par
             b = _parse_signed_balance(r.get(balance_label, ""))
             if b is not None:
                 closing = b
+                balances_seen += 1
+                if is_opening and opening is None:
+                    opening = b
+    # Statements that print no running balance per row (Axis) only show the
+    # opening balance; the closing figure is then opening + credits - debits.
+    if opening is not None and balances_seen <= 1 and debit_label and credit_label:
+        closing = opening + credits - debits
     return {
         "rows": len(rows),
         "needs_review": sum(1 for r in rows if r.get(_NEEDS_REVIEW_KEY)),

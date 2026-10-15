@@ -13,7 +13,7 @@ fix made for one bank keeps helping every other bank:
                       differs from the bank's usual format.
 
 "verified" banks have been checked end-to-end against a real statement
-(totals reconciled). "beta" banks run the same generic engine with the
+(totals reconciled): SIB, SBI, Federal, CSB, Axis, Bank of Baroda. "beta" banks run the same generic engine with the
 hints below, but have not been validated against a real sample yet.
 
 Auto-detection reads only the PDF's text layer (no OCR), so it costs a
@@ -42,6 +42,18 @@ BANKS = [
      "ifsc": ["CSBK"], "names": ["csb bank", "catholic syrian bank"],
      "header_hints": ["trans", "details", "debits", "credits"],
      "header_expect": ["details", "debit", "credit", "balance"]},
+    {"id": "axis", "name": "Axis Bank", "short": "Axis", "status": "verified",
+     "ifsc": ["UTIB"], "names": ["axis bank"],
+     # "Txn Date | Transaction | Withdrawals | Deposits | Balance | Other
+     # Information"; no running balance per row; a Recurring Deposit table
+     # may follow the savings table (left out as another account).
+     "header_hints": ["txn", "transaction", "withdrawals", "deposits"],
+     "header_expect": ["withdrawal", "deposit", "balance"]},
+    {"id": "bob", "name": "Bank of Baroda", "short": "BoB", "status": "verified",
+     "ifsc": ["BARB"], "names": ["bank of baroda"],
+     # "DATE | NARRATION | CHQ.NO. | WITHDRAWAL (DR) | DEPOSIT (CR) | BALANCE"
+     "header_hints": ["narration", "withdrawal", "deposit", "chq"],
+     "header_expect": ["narration", "withdrawal", "deposit", "balance"]},
     # ---- beta: generic engine + hints, not yet validated on a real sample ----
     {"id": "hdfc", "name": "HDFC Bank", "short": "HDFC", "status": "beta",
      "ifsc": ["HDFC"], "names": ["hdfc bank"],
@@ -51,10 +63,6 @@ BANKS = [
      "ifsc": ["ICIC"], "names": ["icici bank"],
      "header_hints": ["transaction", "remarks", "withdrawal", "deposit"],
      "header_expect": ["withdrawal", "deposit", "balance"]},
-    {"id": "axis", "name": "Axis Bank", "short": "Axis", "status": "beta",
-     "ifsc": ["UTIB"], "names": ["axis bank"],
-     "header_hints": ["tran", "particulars", "debit", "credit"],
-     "header_expect": ["particulars", "debit", "credit", "balance"]},
     {"id": "kotak", "name": "Kotak Mahindra Bank", "short": "Kotak", "status": "beta",
      "ifsc": ["KKBK"], "names": ["kotak mahindra"],
      "header_hints": ["description", "withdrawal", "deposit", "ref"],
@@ -63,10 +71,6 @@ BANKS = [
      "ifsc": ["CNRB"], "names": ["canara bank"],
      "header_hints": ["particulars", "debit", "credit", "value"],
      "header_expect": ["debit", "credit", "balance"]},
-    {"id": "bob", "name": "Bank of Baroda", "short": "BoB", "status": "beta",
-     "ifsc": ["BARB"], "names": ["bank of baroda"],
-     "header_hints": ["narration", "withdrawal", "deposit", "chq"],
-     "header_expect": ["withdrawal", "deposit", "balance"]},
     {"id": "union", "name": "Union Bank of India", "short": "Union", "status": "beta",
      "ifsc": ["UBIN"], "names": ["union bank of india"],
      "header_hints": ["remarks", "withdrawals", "deposits", "tran"],
@@ -120,18 +124,32 @@ def public_bank_list():
 _IFSC_LABELLED_RE = re.compile(r"\bIFS(?:C)?\s*(?:Code)?\s*[:\-]?\s*([A-Z]{4})0[A-Z0-9]{6}\b", re.IGNORECASE)
 
 
+def _text_flags(pdf_path, idxs=None):
+    """Which pages have a real text layer, via pdfium (milliseconds). Asking
+    pdfplumber instead makes pdfminer parse the whole page drawing, which on
+    scanned/vector-drawn statements (SIB, SBI) costs seconds per page."""
+    from extractor import text_layer_flags
+    idxs = None if idxs is None else list(idxs)
+    flags = text_layer_flags(pdf_path, pages=idxs)
+    if flags is None:
+        return None
+    return flags if idxs is None else [flags[i] for i in idxs if 0 <= i < len(flags)]
+
+
 def detect_bank(pdf_path, max_pages=1):
     """
     Returns (bank_id or None, is_scanned, reason). Never runs OCR.
     """
+    flags = _text_flags(pdf_path, range(max_pages))
+    if flags is not None and not any(flags):
+        return None, True, "scanned"
     try:
         with pdfplumber.open(pdf_path) as pdf:
             pages = pdf.pages[:max_pages]
             text = "\n".join((p.extract_text() or "") for p in pages)
-            is_scanned = all(len(p.chars) == 0 for p in pages)
     except Exception:
         return None, False, "unreadable"
-    if is_scanned or not text.strip():
+    if not text.strip():
         return None, True, "scanned"
 
     for m in _IFSC_LABELLED_RE.finditer(text):
@@ -152,12 +170,8 @@ def detect_bank(pdf_path, max_pages=1):
 
 
 def likely_scanned(pdf_path, sample_pages=3):
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pages = pdf.pages[:sample_pages]
-            return all(len(p.chars) == 0 for p in pages)
-    except Exception:
-        return False
+    flags = _text_flags(pdf_path, range(sample_pages))
+    return bool(flags) and not any(flags)
 
 
 def header_matches_profile(header, profile):
@@ -175,10 +189,11 @@ def header_matches_profile(header, profile):
 # Printed statement totals -> cross-check against what was extracted
 # ---------------------------------------------------------------------------
 
-_AMT_TOKEN_RE = re.compile(r"^-?[\d,]+\.\d{2}(?:\s*\(?(?:cr|dr)\)?)?$", re.IGNORECASE)
+# 1-2 decimals: Federal prints its GRAND TOTAL as "583085.0".
+_AMT_TOKEN_RE = re.compile(r"^-?[\d,]+\.\d{1,2}(?:\s*\(?(?:cr|dr)\)?)?$", re.IGNORECASE)
 
 _SUMMARY_LABELS = [
-    ("opening", re.compile(r"opening\s+balance", re.I)),
+    ("opening", re.compile(r"opening\s+balance|brought\s+forward", re.I)),
     ("debits", re.compile(r"total\s+(?:debit|withdrawal)s?(?:\s+amount)?", re.I)),
     ("credits", re.compile(r"total\s+(?:credit|deposit)s?(?:\s+amount)?", re.I)),
     ("closing", re.compile(r"closing\s+balance", re.I)),
@@ -200,22 +215,32 @@ def _amounts_in(line_text):
     return [t for t in line_text.split() if _AMT_TOKEN_RE.match(t)]
 
 
-def read_printed_summary(pdf_path):
+def read_printed_summary(pdf_path, ocr_lines=None):
     """
     Look for a printed summary on the first and last page (text layer only):
       * a label row with a value row under it (CSB: "Opening Balance | Total
         Debit Amount | Total Credit Amount | Closing Balance" / "513.80 | ...")
       * labels with values on the same line ("Closing Balance : 96,794.00 Cr")
       * "GRAND TOTAL <debits> <credits>" (Federal)
+      * the same from OCR'd text (`ocr_lines`) for scanned statements, where
+        the summary may start on one page and continue on the next (SBI)
     Returns a dict with any of opening/debits/credits/closing.
     """
     found = {}
+    texts = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
             idxs = sorted({0, len(pdf.pages) - 1})
+            flags = _text_flags(pdf_path, idxs)
+            flags = dict(zip(idxs, flags)) if flags is not None else None
+            # Scanned pages have no text to read here (and asking pdfminer
+            # would cost seconds per page), so skip them.
+            idxs = [i for i in idxs if flags is None or flags.get(i)]
             texts = [pdf.pages[i].extract_text() or "" for i in idxs]
     except Exception:
-        return found
+        texts = []
+    if ocr_lines:
+        texts.append("\n".join(ocr_lines))
     for text in texts:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for i, ln in enumerate(lines):
@@ -228,12 +253,16 @@ def read_printed_summary(pdf_path):
             keys = [k for _, k in labels]
             if keys:
                 amts = _amounts_in(ln)
+                pairs = []
                 if len(amts) == len(keys):
                     pairs = zip(keys, amts)
-                elif not amts and i + 1 < len(lines) and len(_amounts_in(lines[i + 1])) == len(keys):
-                    pairs = zip(keys, _amounts_in(lines[i + 1]))
-                else:
-                    pairs = []
+                elif not amts:
+                    # Figures on a following line -- possibly after a page
+                    # footer when the summary spans two pages (SBI).
+                    for nxt in lines[i + 1:i + 4]:
+                        if len(_amounts_in(nxt)) == len(keys):
+                            pairs = zip(keys, _amounts_in(nxt))
+                            break
                 for k, a in pairs:
                     v = _to_float(a)
                     if v is not None and k not in found:
@@ -243,6 +272,8 @@ def read_printed_summary(pdf_path):
                 if len(amts) >= 2:
                     found.setdefault("debits", _to_float(amts[0]))
                     found.setdefault("credits", _to_float(amts[1]))
+                if len(amts) >= 3:
+                    found.setdefault("closing", _to_float(amts[2]))
     return found
 
 
