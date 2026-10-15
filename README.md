@@ -84,10 +84,11 @@ validate against — only the structured date/amount columns are.
 ## Bank selection, auto-detect and totals check
 
 The UI asks which bank issued the statement. Verified banks (checked end to
-end against real statements): **South Indian Bank, SBI, Federal Bank, CSB
-Bank**. Beta banks (generic engine + header hints, not yet validated on a
-real sample): HDFC, ICICI, Axis, Kotak, Canara, Bank of Baroda, Union, PNB,
-IDFC FIRST, ESAF, Dhanlaxmi, Kerala Gramin. "Other bank" uses the fully
+end against real statements, totals matching the printed figures): **South
+Indian Bank, SBI, Federal Bank, CSB Bank, Axis Bank, Bank of Baroda**. Beta
+banks (generic engine + header hints, not yet validated on a real sample):
+HDFC, ICICI, Kotak, Canara, Union, PNB, IDFC FIRST, ESAF, Dhanlaxmi, Kerala
+Gramin. "Other bank" uses the fully
 generic layout detection.
 
 - Profiles live in `backend/banks.py`. They are hints for the single
@@ -100,6 +101,34 @@ generic layout detection.
   GRAND TOTAL) and shown in the result panel.
 - Bordered tables (e.g. CSB): when the PDF has vertical table rulings, they
   are used as exact column boundaries.
+
+## Speed and accuracy notes (scanned statements)
+
+SIB and SBI statements have no text layer (text is drawn as vector glyphs),
+so every page is OCR'd. Measured on SIB (86 pages) and SBI (45 pages):
+
+- Tesseract runs single-threaded (`OMP_THREAD_LIMIT=1`, set in extractor.py):
+  its own multi-threading was ~4x slower per page and fought the parallel
+  page workers. OCR output is byte-identical.
+- The "does this page have text?" check uses pdfium (milliseconds) instead of
+  pdfminer, which parsed the whole page drawing first (1.5-3.7s per page) and
+  kept every page in memory (SIB grew past 3 GB).
+- Cell re-reads are batched: one Tesseract run per page per cell type instead
+  of one per cell (identical results).
+- Result: SIB 12.8s -> 3.2s per page, SBI 14.7s -> 2.6s per page on a 2-core
+  machine, before the desktop app's parallel workers.
+
+Accuracy safeguards added while profiling (all three test statements now
+match their printed totals exactly):
+
+- Unlabelled "Page Total" lines (OCR missed the label) are recognised and no
+  longer merged into the last transaction of the page.
+- A line garbled by a dashed table rule is re-read once with the rule erased.
+- The running-balance check tells a misread balance (corrected) from a
+  misread amount (solved from the two balances and flagged for review),
+  instead of letting one bad amount rewrite every later balance.
+- Printed totals are read from OCR text too, so scanned statements get the
+  totals check in the result panel.
 
 ## Web app: local run
 ```bash

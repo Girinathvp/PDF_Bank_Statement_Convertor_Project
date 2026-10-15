@@ -217,7 +217,12 @@ def _run_job(job_id, merge_pages, bank_id):
         summary = write_excel(results, output_path, merge_pages=merge_pages) or {}
 
         _set_stage(job_id, "validating")
-        printed = banks.read_printed_summary(pdf_path)
+        # Scanned statements: the summary is only available as OCR'd text
+        # of the first and last two pages (SBI's summary spans two pages).
+        pages = sorted(results)
+        edge = [p for p in pages if p == pages[0] or p >= pages[-1] - 1] if pages else []
+        ocr_lines = [ln for p in edge for ln in (results[p].get("lines_text") or [])]
+        printed = banks.read_printed_summary(pdf_path, ocr_lines=ocr_lines or None)
         checks = banks.compare_totals(printed, summary)
         warnings = []
         if detected and bank_id not in ("other", detected):
